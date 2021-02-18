@@ -71,16 +71,17 @@ $ nix-env -i croc
 ```
 
 
+On Alpine Linux you have to install dependencies first:
+
+```
+$ apk add bash coreutils
+$ wget -qO- https://getcroc.schollz.com | bash
+```
+
 On Arch Linux you can install the latest release with `pacman`:
 
 ```
 $ pacman -S croc
-```
-
-On Ubuntu you can install with `snap`:
-
-```
-$ snap install croc
 ```
 
 On Gentoo you can install with `portage`:
