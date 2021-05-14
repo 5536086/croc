@@ -12,6 +12,7 @@ import (
 	"io/ioutil"
 	"log"
 	"math"
+	"math/big"
 	"net"
 	"net/http"
 	"os"
@@ -41,9 +42,32 @@ func GetInput(prompt string) string {
 	return strings.TrimSpace(text)
 }
 
-// HashFile returns the hash of a file
-func HashFile(fname string) (hash256 []byte, err error) {
-	return IMOHashFile(fname)
+// HashFile returns the hash of a file or, in case of a symlink, the
+// SHA256 hash of its target. Takes an argument to specify the algorithm to use.
+func HashFile(fname string, algorithm string) (hash256 []byte, err error) {
+	var fstats os.FileInfo
+	fstats, err = os.Lstat(fname)
+	if err != nil {
+		return nil, err
+	}
+	if fstats.Mode()&os.ModeSymlink != 0 {
+		var target string
+		target, err = os.Readlink(fname)
+		return []byte(SHA256(target)), nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	switch algorithm {
+	case "imohash":
+		return IMOHashFile(fname)
+	case "md5":
+		return MD5HashFile(fname)
+	case "xxhash":
+		return XXHashFile(fname)
+	}
+	err = fmt.Errorf("unspecified algorithm")
+	return
 }
 
 // MD5HashFile returns MD5 hash
@@ -66,6 +90,15 @@ func MD5HashFile(fname string) (hash256 []byte, err error) {
 // IMOHashFile returns imohash
 func IMOHashFile(fname string) (hash []byte, err error) {
 	b, err := imohash.SumFile(fname)
+	hash = b[:]
+	return
+}
+
+var imofull = imohash.NewCustom(0, 0)
+
+// IMOHashFileFull returns imohash of full file
+func IMOHashFileFull(fname string) (hash []byte, err error) {
+	b, err := imofull.SumFile(fname)
 	hash = b[:]
 	return
 }
@@ -125,13 +158,27 @@ func LocalIP() string {
 	return localAddr.IP.String()
 }
 
+func GenerateRandomPin() string {
+	s := ""
+	max := new(big.Int)
+	max.SetInt64(9)
+	for i := 0; i < 4; i++ {
+		v, err := rand.Int(rand.Reader, max)
+		if err != nil {
+			panic(err)
+		}
+		s += fmt.Sprintf("%d", v)
+	}
+	return s
+}
+
 // GetRandomName returns mnemoicoded random name
 func GetRandomName() string {
 	var result []string
 	bs := make([]byte, 4)
 	rand.Read(bs)
 	result = mnemonicode.EncodeWordList(result, bs)
-	return strings.Join(result, "-")
+	return GenerateRandomPin() + "-" + strings.Join(result, "-")
 }
 
 // ByteCountDecimal converts bytes to human readable byte string

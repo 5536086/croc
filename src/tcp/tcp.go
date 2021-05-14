@@ -9,11 +9,11 @@ import (
 	"time"
 
 	log "github.com/schollz/logger"
-	"github.com/schollz/pake/v2"
+	"github.com/schollz/pake/v3"
 
-	"github.com/schollz/croc/v8/src/comm"
-	"github.com/schollz/croc/v8/src/crypt"
-	"github.com/schollz/croc/v8/src/models"
+	"github.com/schollz/croc/v9/src/comm"
+	"github.com/schollz/croc/v9/src/crypt"
+	"github.com/schollz/croc/v9/src/models"
 )
 
 type server struct {
@@ -152,7 +152,7 @@ var weakKey = []byte{1, 2, 3}
 
 func (s *server) clientCommunication(port string, c *comm.Comm) (room string, err error) {
 	// establish secure password with PAKE for communication with relay
-	B, err := pake.InitCurve(weakKey, 1, "siec", 1*time.Microsecond)
+	B, err := pake.InitCurve(weakKey, 1, "siec")
 	if err != nil {
 		return
 	}
@@ -170,11 +170,6 @@ func (s *server) clientCommunication(port string, c *comm.Comm) (room string, er
 		return
 	}
 	err = c.Send(B.Bytes())
-	Abytes, err = c.Receive()
-	if err != nil {
-		return
-	}
-	err = B.Update(Abytes)
 	if err != nil {
 		return
 	}
@@ -186,6 +181,9 @@ func (s *server) clientCommunication(port string, c *comm.Comm) (room string, er
 
 	// receive salt
 	salt, err := c.Receive()
+	if err != nil {
+		return
+	}
 	strongKeyForEncryption, _, err := crypt.New(strongKey, salt)
 	if err != nil {
 		return
@@ -268,7 +266,6 @@ func (s *server) clientCommunication(port string, c *comm.Comm) (room string, er
 		err = c.Send(bSend)
 		if err != nil {
 			log.Error(err)
-			s.deleteRoom(room)
 			return
 		}
 		return
@@ -419,7 +416,7 @@ func ConnectToTCPServer(address, password, room string, timelimit ...time.Durati
 	}
 
 	// get PAKE connection with server to establish strong key to transfer info
-	A, err := pake.InitCurve(weakKey, 0, "siec", 1*time.Microsecond)
+	A, err := pake.InitCurve(weakKey, 0, "siec")
 	if err != nil {
 		return
 	}
@@ -435,10 +432,6 @@ func ConnectToTCPServer(address, password, room string, timelimit ...time.Durati
 	if err != nil {
 		return
 	}
-	err = c.Send(A.Bytes())
-	if err != nil {
-		return
-	}
 	strongKey, err := A.SessionKey()
 	if err != nil {
 		return
@@ -446,6 +439,9 @@ func ConnectToTCPServer(address, password, room string, timelimit ...time.Durati
 	log.Debugf("strong key: %x", strongKey)
 
 	strongKeyForEncryption, salt, err := crypt.New(strongKey, nil)
+	if err != nil {
+		return
+	}
 	// send salt
 	err = c.Send(salt)
 	if err != nil {

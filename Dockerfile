@@ -1,4 +1,4 @@
-FROM golang:1.15-alpine as builder
+FROM golang:1.16-alpine as builder
 RUN apk add --no-cache git
 WORKDIR /go/croc
 COPY . .
@@ -11,5 +11,6 @@ EXPOSE 9011
 EXPOSE 9012
 EXPOSE 9013
 COPY --from=builder /go/croc/croc /go/croc/croc-entrypoint.sh /
+USER nobody
 ENTRYPOINT ["/croc-entrypoint.sh"]
 CMD ["relay"]

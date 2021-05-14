@@ -6,16 +6,18 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"net/url"
+	"strings"
 	"time"
 
-	"github.com/schollz/croc/v8/src/utils"
+	"github.com/schollz/croc/v9/src/utils"
 	log "github.com/schollz/logger"
 	"golang.org/x/net/proxy"
 )
 
 var Socks5Proxy = ""
 
-const MAXBYTES = 4000000
+var MAGIC_BYTES = []byte("croc")
 
 // Comm is some basic TCP communication
 type Comm struct {
@@ -31,7 +33,16 @@ func NewConnection(address string, timelimit ...time.Duration) (c *Comm, err err
 	var connection net.Conn
 	if Socks5Proxy != "" && !utils.IsLocalIP(address) {
 		var dialer proxy.Dialer
-		dialer, err = proxy.SOCKS5("tcp", Socks5Proxy, nil, proxy.Direct)
+		// prepend schema if no schema is given
+		if !strings.Contains(Socks5Proxy, `://`) {
+			Socks5Proxy = `socks5://` + Socks5Proxy
+		}
+		socks5ProxyURL, urlParseError := url.Parse(Socks5Proxy)
+		if urlParseError != nil {
+			err = fmt.Errorf("Unable to parse socks proxy url: %s", urlParseError)
+			return
+		}
+		dialer, err = proxy.FromURL(socks5ProxyURL, proxy.Direct)
 		if err != nil {
 			err = fmt.Errorf("proxy failed: %w", err)
 			return
@@ -84,6 +95,7 @@ func (c *Comm) Write(b []byte) (n int, err error) {
 		fmt.Println("binary.Write failed:", err)
 	}
 	tmpCopy := append(header.Bytes(), b...)
+	tmpCopy = append(MAGIC_BYTES, tmpCopy...)
 	n, err = c.connection.Write(tmpCopy)
 	if err != nil {
 		err = fmt.Errorf("connection.Write failed: %w", err)
@@ -104,8 +116,20 @@ func (c *Comm) Read() (buf []byte, numBytes int, bs []byte, err error) {
 	// must clear the timeout setting
 	defer c.connection.SetDeadline(time.Time{})
 
-	// read until we get 4 bytes for the header
+	// read until we get 4 bytes for the magic
 	header := make([]byte, 4)
+	_, err = io.ReadFull(c.connection, header)
+	if err != nil {
+		log.Debugf("initial read error: %v", err)
+		return
+	}
+	if !bytes.Equal(header, MAGIC_BYTES) {
+		err = fmt.Errorf("initial bytes are not magic: %x", header)
+		return
+	}
+
+	// read until we get 4 bytes for the header
+	header = make([]byte, 4)
 	_, err = io.ReadFull(c.connection, header)
 	if err != nil {
 		log.Debugf("initial read error: %v", err)
@@ -121,11 +145,6 @@ func (c *Comm) Read() (buf []byte, numBytes int, bs []byte, err error) {
 		return
 	}
 	numBytes = int(numBytesUint32)
-	if numBytes > MAXBYTES {
-		err = fmt.Errorf("too many bytes: %d", numBytes)
-		log.Debug(err)
-		return
-	}
 
 	// shorten the reading deadline in case getting weird data
 	if err := c.connection.SetReadDeadline(time.Now().Add(10 * time.Second)); err != nil {
