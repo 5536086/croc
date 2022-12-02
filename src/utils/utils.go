@@ -1,21 +1,24 @@
 package utils
 
 import (
+	"archive/zip"
 	"bufio"
 	"bytes"
+	"compress/flate"
 	"crypto/md5"
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"log"
 	"math"
 	"math/big"
 	"net"
 	"net/http"
 	"os"
+	"path"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -23,6 +26,27 @@ import (
 	"github.com/kalafut/imohash"
 	"github.com/schollz/mnemonicode"
 )
+
+// Get or create home directory
+func GetConfigDir() (homedir string, err error) {
+	homedir, err = os.UserHomeDir()
+	if err != nil {
+		return
+	}
+
+	if envHomedir, isSet := os.LookupEnv("CROC_CONFIG_DIR"); isSet {
+		homedir = envHomedir
+	} else if xdgConfigHome, isSet := os.LookupEnv("XDG_CONFIG_HOME"); isSet {
+		homedir = path.Join(xdgConfigHome, "croc")
+	} else {
+		homedir = path.Join(homedir, ".config", "croc")
+	}
+
+	if _, err = os.Stat(homedir); os.IsNotExist(err) {
+		err = os.MkdirAll(homedir, 0700)
+	}
+	return
+}
 
 // Exists reports whether the named file or directory exists.
 func Exists(name string) bool {
@@ -53,10 +77,10 @@ func HashFile(fname string, algorithm string) (hash256 []byte, err error) {
 	if fstats.Mode()&os.ModeSymlink != 0 {
 		var target string
 		target, err = os.Readlink(fname)
+		if err != nil {
+			return nil, err
+		}
 		return []byte(SHA256(target)), nil
-	}
-	if err != nil {
-		return nil, err
 	}
 	switch algorithm {
 	case "imohash":
@@ -136,7 +160,7 @@ func PublicIP() (ip string, err error) {
 	defer resp.Body.Close()
 
 	if resp.StatusCode == http.StatusOK {
-		bodyBytes, err := ioutil.ReadAll(resp.Body)
+		bodyBytes, err := io.ReadAll(resp.Body)
 		if err != nil {
 			return "", err
 		}
@@ -172,7 +196,7 @@ func GenerateRandomPin() string {
 	return s
 }
 
-// GetRandomName returns mnemoicoded random name
+// GetRandomName returns mnemonicoded random name
 func GetRandomName() string {
 	var result []string
 	bs := make([]byte, 4)
@@ -283,7 +307,7 @@ func GetLocalIPs() (ips []string, err error) {
 }
 
 func RandomFileName() (fname string, err error) {
-	f, err := ioutil.TempFile(".", "croc-stdin-")
+	f, err := os.CreateTemp(".", "croc-stdin-")
 	if err != nil {
 		return
 	}
@@ -347,4 +371,92 @@ func IsLocalIP(ipaddress string) bool {
 		}
 	}
 	return false
+}
+
+func ZipDirectory(destination string, source string) (err error) {
+	if _, err := os.Stat(destination); err == nil {
+		log.Fatalf("%s file already exists!\n", destination)
+	}
+	fmt.Fprintf(os.Stderr, "Zipping %s to %s\n", source, destination)
+	file, err := os.Create(destination)
+	if err != nil {
+		log.Fatalln(err)
+	}
+	defer file.Close()
+	writer := zip.NewWriter(file)
+	// no compression because croc does its compression on the fly
+	writer.RegisterCompressor(zip.Deflate, func(out io.Writer) (io.WriteCloser, error) {
+		return flate.NewWriter(out, flate.NoCompression)
+	})
+	defer writer.Close()
+	err = filepath.Walk(source, func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			log.Fatalln(err)
+		}
+		if info.Mode().IsRegular() {
+			f1, err := os.Open(path)
+			if err != nil {
+				log.Fatalln(err)
+			}
+			defer f1.Close()
+			zip_path := strings.ReplaceAll(path, source, strings.TrimSuffix(destination, ".zip"))
+			w1, err := writer.Create(zip_path)
+			if err != nil {
+				log.Fatalln(err)
+			}
+			if _, err := io.Copy(w1, f1); err != nil {
+				log.Fatalln(err)
+			}
+			fmt.Fprintf(os.Stderr, "\r\033[2K")
+			fmt.Fprintf(os.Stderr, "\rAdding %s", zip_path)
+		}
+		return nil
+	})
+	if err != nil {
+		log.Fatalln(err)
+	}
+	fmt.Fprintf(os.Stderr, "\n")
+	return nil
+}
+
+func UnzipDirectory(destination string, source string) error {
+
+	archive, err := zip.OpenReader(source)
+	if err != nil {
+		log.Fatalln(err)
+	}
+	defer archive.Close()
+
+	for _, f := range archive.File {
+		filePath := filepath.Join(destination, f.Name)
+		fmt.Fprintf(os.Stderr, "\r\033[2K")
+		fmt.Fprintf(os.Stderr, "\rUnzipping file %s", filePath)
+		if f.FileInfo().IsDir() {
+			os.MkdirAll(filePath, os.ModePerm)
+			continue
+		}
+
+		if err := os.MkdirAll(filepath.Dir(filePath), os.ModePerm); err != nil {
+			log.Fatalln(err)
+		}
+
+		dstFile, err := os.OpenFile(filePath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, f.Mode())
+		if err != nil {
+			log.Fatalln(err)
+		}
+
+		fileInArchive, err := f.Open()
+		if err != nil {
+			log.Fatalln(err)
+		}
+
+		if _, err := io.Copy(dstFile, fileInArchive); err != nil {
+			log.Fatalln(err)
+		}
+
+		dstFile.Close()
+		fileInArchive.Close()
+	}
+	fmt.Fprintf(os.Stderr, "\n")
+	return nil
 }

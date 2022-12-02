@@ -86,7 +86,7 @@ print_help() {
       Default = /usr/local/bin ('\${PREFIX}/bin' on Termux for Android)
   
   -h
-      Prints this helpfull message and exit."
+      Prints this helpful message and exit."
 
   echo "${help_header}"
   echo ""
@@ -159,7 +159,7 @@ make_tempdir() {
 #   DESCRIPTION:  Attempts to determin host os using uname
 #    PARAMETERS:  none
 #       RETURNS:  0 = OS Detected. Also prints detected os to stdout
-#                 1 = Unkown OS
+#                 1 = Unknown OS
 #                 20 = 'uname' not found in path
 #-------------------------------------------------------------------------------
 determine_os() {
@@ -183,7 +183,7 @@ determine_os() {
 #   DESCRIPTION:  Attempt to determin architecture of host
 #    PARAMETERS:  none
 #       RETURNS:  0 = Arch Detected. Also prints detected arch to stdout
-#                 1 = Unkown arch
+#                 1 = Unknown arch
 #                 20 = 'uname' not found in path
 #-------------------------------------------------------------------------------
 determine_arch() {
@@ -238,7 +238,7 @@ download_file() {
 #---  FUNCTION  ----------------------------------------------------------------
 #          NAME:  checksum_check
 #   DESCRIPTION:  Attempt to verify checksum of downloaded file to ensure
-#                 integrity.  Tries multiple tools before faling.
+#                 integrity.  Tries multiple tools before failing.
 #    PARAMETERS:  $1 = path to checksum file
 #                 $2 = location of file to check
 #                 $3 = working directory
@@ -300,10 +300,10 @@ checksum_check() {
 #---  FUNCTION  ----------------------------------------------------------------
 #          NAME:  extract_file
 #   DESCRIPTION:  Extracts a file into a location.  Attempts to determine which
-#                 tool to use by checking file extention.
+#                 tool to use by checking file extension.
 #    PARAMETERS:  $1 = file to extract
 #                 $2 = location to extract file into
-#                 $3 = extention
+#                 $3 = extension
 #       RETURNS:  Return code of the tool used to extract the file
 #                 20 = Failed to determine which tool to use
 #                 30 = Failed to find tool in path
@@ -528,7 +528,7 @@ main() {
   local autocomplete_install_rcode
 
   croc_bin_name="croc"
-  croc_version="9.1.4"
+  croc_version="9.6.1"
   croc_dl_ext="tar.gz"
   croc_base_url="https://github.com/schollz/croc/releases/download"
   prefix="${1}"
@@ -684,7 +684,7 @@ main() {
     print_message "== Install prefix already exists. No need to create it." "info"
   fi
 
-
+  [ ! -d "/etc/bash_completion.d/croc" ] && mkdir -p "/etc/bash_completion.d/croc"
   case "${croc_os}" in
     "Linux" ) install_file_linux "${tmpdir}/${croc_bin_name}" "${prefix}/";
               install_file_rcode="${?}";;
