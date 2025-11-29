@@ -6,8 +6,10 @@ import (
 	"net"
 	"os"
 	"path"
+	"time"
 
-	"github.com/schollz/croc/v9/src/utils"
+	"github.com/schollz/croc/v10/src/utils"
+	log "github.com/schollz/logger"
 )
 
 // TCP_BUFFER_SIZE is the maximum packet size
@@ -22,8 +24,8 @@ var (
 	INTERNAL_DNS       = false
 )
 
-// publicDns are servers to be queried if a local lookup fails
-var publicDns = []string{
+// publicDNS are servers to be queried if a local lookup fails
+var publicDNS = []string{
 	"1.0.0.1",                // Cloudflare
 	"1.1.1.1",                // Cloudflare
 	"[2606:4700:4700::1111]", // Cloudflare
@@ -44,8 +46,8 @@ var publicDns = []string{
 	"[2620:119:53::53]",      // Cisco OpenDNS
 }
 
-func getConfigFile() (fname string, err error) {
-	configFile, err := utils.GetConfigDir()
+func getConfigFile(requireValidPath bool) (fname string, err error) {
+	configFile, err := utils.GetConfigDir(requireValidPath)
 	if err != nil {
 		return
 	}
@@ -54,6 +56,8 @@ func getConfigFile() (fname string, err error) {
 }
 
 func init() {
+	log.SetLevel("info")
+	log.SetOutput(os.Stderr)
 	doRemember := false
 	for _, flag := range os.Args {
 		if flag == "--internal-dns" {
@@ -66,18 +70,19 @@ func init() {
 	}
 	if doRemember {
 		// save in config file
-		fname, err := getConfigFile()
+		fname, err := getConfigFile(true)
 		if err == nil {
 			f, _ := os.Create(fname)
 			f.Close()
 		}
 	}
 	if !INTERNAL_DNS {
-		fname, err := getConfigFile()
+		fname, err := getConfigFile(false)
 		if err == nil {
 			INTERNAL_DNS = utils.Exists(fname)
 		}
 	}
+	log.Trace("Using internal DNS: ", INTERNAL_DNS)
 	var err error
 	var addr string
 	addr, err = lookup(DEFAULT_RELAY)
@@ -86,33 +91,38 @@ func init() {
 	} else {
 		DEFAULT_RELAY = ""
 	}
+	log.Tracef("Default ipv4 relay: %s", addr)
 	addr, err = lookup(DEFAULT_RELAY6)
 	if err == nil {
 		DEFAULT_RELAY6 = net.JoinHostPort(addr, DEFAULT_PORT)
 	} else {
 		DEFAULT_RELAY6 = ""
 	}
+	log.Tracef("Default ipv6 relay: %s", addr)
 }
 
 // Resolve a hostname to an IP address using DNS.
 func lookup(address string) (ipaddress string, err error) {
 	if !INTERNAL_DNS {
+		log.Tracef("Using local DNS to resolve %s", address)
 		return localLookupIP(address)
 	}
 	type Result struct {
 		s   string
 		err error
 	}
-	result := make(chan Result, len(publicDns))
-	for _, dns := range publicDns {
+	result := make(chan Result, len(publicDNS))
+	for _, dns := range publicDNS {
 		go func(dns string) {
 			var r Result
 			r.s, r.err = remoteLookupIP(address, dns)
+			log.Tracef("Resolved %s to %s using %s", address, r.s, dns)
 			result <- r
 		}(dns)
 	}
-	for i := 0; i < len(publicDns); i++ {
+	for i := 0; i < len(publicDNS); i++ {
 		ipaddress = (<-result).s
+		log.Tracef("Resolved %s to %s", address, ipaddress)
 		if ipaddress != "" {
 			return
 		}
@@ -121,9 +131,16 @@ func lookup(address string) (ipaddress string, err error) {
 	return
 }
 
-// localLookupIP returns a host's IP address based on the local resolver.
+// localLookupIP returns a host's IP address using the local DNS configuration.
 func localLookupIP(address string) (ipaddress string, err error) {
-	ip, err := net.LookupHost(address)
+	// Create a context with a 500 millisecond timeout
+	ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
+	defer cancel()
+
+	r := &net.Resolver{}
+
+	// Use the context with timeout in the LookupHost function
+	ip, err := r.LookupHost(ctx, address)
 	if err != nil {
 		return
 	}
@@ -133,14 +150,17 @@ func localLookupIP(address string) (ipaddress string, err error) {
 
 // remoteLookupIP returns a host's IP address based on a remote DNS server.
 func remoteLookupIP(address, dns string) (ipaddress string, err error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
+	defer cancel()
+
 	r := &net.Resolver{
 		PreferGo: true,
-		Dial: func(ctx context.Context, network, address string) (net.Conn, error) {
+		Dial: func(ctx context.Context, network, _ string) (net.Conn, error) {
 			d := new(net.Dialer)
 			return d.DialContext(ctx, network, dns+":53")
 		},
 	}
-	ip, err := r.LookupHost(context.Background(), address)
+	ip, err := r.LookupHost(ctx, address)
 	if err != nil {
 		return
 	}

@@ -7,8 +7,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/schollz/croc/v9/src/comm"
-	"github.com/schollz/croc/v9/src/crypt"
+	"github.com/schollz/croc/v10/src/comm"
+	"github.com/schollz/croc/v10/src/crypt"
 	log "github.com/schollz/logger"
 	"github.com/stretchr/testify/assert"
 )
@@ -20,7 +20,7 @@ func TestMessage(t *testing.T) {
 	m := Message{Type: TypeMessage, Message: "hello, world"}
 	e, salt, err := crypt.New([]byte("pass"), nil)
 	assert.Nil(t, err)
-	fmt.Println(salt)
+	fmt.Println(string(salt))
 	b, err := Encode(e, m)
 	assert.Nil(t, err)
 	fmt.Printf("%x\n", b)
@@ -54,7 +54,7 @@ func TestSend(t *testing.T) {
 
 	port := "8801"
 	go func() {
-		log.Debugf("starting TCP server on " + port)
+		log.Debug("starting TCP server on " + port)
 		server, err := net.Listen("tcp", "0.0.0.0:"+port)
 		if err != nil {
 			log.Error(err)
@@ -67,7 +67,7 @@ func TestSend(t *testing.T) {
 				log.Error(err)
 			}
 			log.Debugf("client %s connected", connection.RemoteAddr().String())
-			go func(port string, connection net.Conn) {
+			go func(_ string, connection net.Conn) {
 				c := comm.New(connection)
 				err = c.Send([]byte("hello, world"))
 				assert.Nil(t, err)
@@ -84,8 +84,8 @@ func TestSend(t *testing.T) {
 		}
 	}()
 
-	time.Sleep(300 * time.Millisecond)
-	a, err := comm.NewConnection("localhost:"+port, 10*time.Minute)
+	time.Sleep(800 * time.Millisecond)
+	a, err := comm.NewConnection("127.0.0.1:"+port, 10*time.Minute)
 	assert.Nil(t, err)
 	m := Message{Type: TypeMessage, Message: "hello, world"}
 	e, salt, err := crypt.New([]byte("pass"), nil)

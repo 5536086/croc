@@ -18,7 +18,7 @@ func CompressWithOption(src []byte, level int) []byte {
 // Compress returns a compressed byte slice.
 func Compress(src []byte) []byte {
 	compressedData := new(bytes.Buffer)
-	compress(src, compressedData, -2)
+	compress(src, compressedData, flate.HuffmanOnly)
 	return compressedData.Bytes()
 }
 
@@ -43,7 +43,7 @@ func compress(src []byte, dest io.Writer, level int) {
 	compressor.Close()
 }
 
-// compress uses flate to decompress an io.Reader
+// decompress uses flate to decompress an io.Reader
 func decompress(src io.Reader, dest io.Writer) {
 	decompressor := flate.NewReader(src)
 	if _, err := io.Copy(dest, decompressor); err != nil {

@@ -11,9 +11,9 @@ import (
 	log "github.com/schollz/logger"
 	"github.com/schollz/pake/v3"
 
-	"github.com/schollz/croc/v9/src/comm"
-	"github.com/schollz/croc/v9/src/crypt"
-	"github.com/schollz/croc/v9/src/models"
+	"github.com/schollz/croc/v10/src/comm"
+	"github.com/schollz/croc/v10/src/crypt"
+	"github.com/schollz/croc/v10/src/models"
 )
 
 type server struct {
@@ -23,6 +23,11 @@ type server struct {
 	banner     string
 	password   string
 	rooms      roomMap
+
+	roomCleanupInterval time.Duration
+	roomTTL             time.Duration
+
+	stopRoomCleanup chan struct{}
 }
 
 type roomInfo struct {
@@ -39,46 +44,55 @@ type roomMap struct {
 
 const pingRoom = "pinglkasjdlfjsaldjf"
 
-var timeToRoomDeletion = 10 * time.Minute
-
-// Run starts a tcp listener, run async
-func Run(debugLevel, host, port, password string, banner ...string) (err error) {
+// newDefaultServer initializes a new server, with some default configuration options
+func newDefaultServer() *server {
 	s := new(server)
+	s.roomCleanupInterval = DEFAULT_ROOM_CLEANUP_INTERVAL
+	s.roomTTL = DEFAULT_ROOM_TTL
+	s.debugLevel = DEFAULT_LOG_LEVEL
+	s.stopRoomCleanup = make(chan struct{})
+	return s
+}
+
+// RunWithOptionsAsync asynchronously starts a TCP listener.
+func RunWithOptionsAsync(host, port, password string, opts ...serverOptsFunc) error {
+	s := newDefaultServer()
 	s.host = host
 	s.port = port
 	s.password = password
-	s.debugLevel = debugLevel
-	if len(banner) > 0 {
-		s.banner = banner[0]
+	for _, opt := range opts {
+		err := opt(s)
+		if err != nil {
+			return fmt.Errorf("could not apply optional configurations: %w", err)
+		}
 	}
 	return s.start()
 }
 
+// Run starts a tcp listener, run async
+func Run(debugLevel, host, port, password string, banner ...string) (err error) {
+	return RunWithOptionsAsync(host, port, password, WithBanner(banner...), WithLogLevel(debugLevel))
+}
+
 func (s *server) start() (err error) {
 	log.SetLevel(s.debugLevel)
-	log.Debugf("starting with password '%s'", s.password)
+
+	// Mask our password in logs
+	maskedPassword := ""
+	if len(s.password) > 2 {
+		maskedPassword = fmt.Sprintf("%c***%c", s.password[0], s.password[len(s.password)-1])
+	} else {
+		maskedPassword = s.password
+	}
+
+	log.Debugf("starting with password '%s'", maskedPassword)
+
 	s.rooms.Lock()
 	s.rooms.rooms = make(map[string]roomInfo)
 	s.rooms.Unlock()
 
-	// delete old rooms
-	go func() {
-		for {
-			time.Sleep(timeToRoomDeletion)
-			var roomsToDelete []string
-			s.rooms.Lock()
-			for room := range s.rooms.rooms {
-				if time.Since(s.rooms.rooms[room].opened) > 3*time.Hour {
-					roomsToDelete = append(roomsToDelete, room)
-				}
-			}
-			s.rooms.Unlock()
-
-			for _, room := range roomsToDelete {
-				s.deleteRoom(room)
-			}
-		}
-	}()
+	go s.deleteOldRooms()
+	defer s.stopRoomDeletion()
 
 	err = s.run()
 	if err != nil {
@@ -93,7 +107,8 @@ func (s *server) run() (err error) {
 	if s.host != "" {
 		ip := net.ParseIP(s.host)
 		if ip == nil {
-			tcpIP, err := net.ResolveIPAddr("ip", s.host)
+			var tcpIP *net.IPAddr
+			tcpIP, err = net.ResolveIPAddr("ip", s.host)
 			if err != nil {
 				return err
 			}
@@ -109,7 +124,7 @@ func (s *server) run() (err error) {
 		}
 	}
 	addr = strings.Replace(addr, "127.0.0.1", "0.0.0.0", 1)
-	log.Infof("starting TCP server on " + addr)
+	log.Info("starting TCP server on " + addr)
 	server, err := net.Listen(network, addr)
 	if err != nil {
 		return fmt.Errorf("error listening on %s: %w", addr, err)
@@ -172,6 +187,39 @@ func (s *server) run() (err error) {
 	}
 }
 
+// deleteOldRooms checks for rooms at a regular interval and removes those that
+// have exceeded their allocated TTL.
+func (s *server) deleteOldRooms() {
+	ticker := time.NewTicker(s.roomCleanupInterval)
+	for {
+		select {
+		case <-ticker.C:
+			var roomsToDelete []string
+			s.rooms.Lock()
+			for room := range s.rooms.rooms {
+				if time.Since(s.rooms.rooms[room].opened) > s.roomTTL {
+					roomsToDelete = append(roomsToDelete, room)
+				}
+			}
+			s.rooms.Unlock()
+
+			for _, room := range roomsToDelete {
+				s.deleteRoom(room)
+				log.Debugf("room cleaned up: %s", room)
+			}
+		case <-s.stopRoomCleanup:
+			ticker.Stop()
+			log.Debug("room cleanup stopped")
+			return
+		}
+	}
+}
+
+func (s *server) stopRoomDeletion() {
+	log.Debug("stop room cleanup fired")
+	s.stopRoomCleanup <- struct{}{}
+}
+
 var weakKey = []byte{1, 2, 3}
 
 func (s *server) clientCommunication(port string, c *comm.Comm) (room string, err error) {
@@ -227,7 +275,7 @@ func (s *server) clientCommunication(port string, c *comm.Comm) (room string, er
 	if strings.TrimSpace(string(passwordBytes)) != s.password {
 		err = fmt.Errorf("bad password")
 		enc, _ := crypt.Encrypt([]byte(err.Error()), strongKeyForEncryption)
-		if err := c.Send(enc); err != nil {
+		if err = c.Send(enc); err != nil {
 			return "", fmt.Errorf("send error: %w", err)
 		}
 		return
@@ -350,11 +398,11 @@ func (s *server) deleteRoom(room string) {
 	}
 	s.rooms.rooms[room] = roomInfo{first: nil, second: nil}
 	delete(s.rooms.rooms, room)
-
 }
 
 // chanFromConn creates a channel from a Conn object, and sends everything it
-//  Read()s from the socket to the channel.
+//
+//	Read()s from the socket to the channel.
 func chanFromConn(conn net.Conn) chan []byte {
 	c := make(chan []byte, 1)
 	if err := conn.SetReadDeadline(time.Now().Add(3 * time.Hour)); err != nil {
@@ -515,7 +563,7 @@ func ConnectToTCPServer(address, password, room string, timelimit ...time.Durati
 	}
 	banner = strings.Split(string(data), "|||")[0]
 	ipaddr = strings.Split(string(data), "|||")[1]
-	log.Debug("sending room")
+	log.Debugf("sending room; %s", room)
 	bSend, err = crypt.Encrypt([]byte(room), strongKeyForEncryption)
 	if err != nil {
 		log.Debug(err)

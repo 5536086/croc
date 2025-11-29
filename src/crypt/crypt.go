@@ -39,7 +39,7 @@ func Encrypt(plaintext []byte, key []byte) (encrypted []byte, err error) {
 	// http://nvlpubs.nist.gov/nistpubs/Legacy/SP/nistspecialpublication800-38d.pdf
 	// Section 8.2
 	ivBytes := make([]byte, 12)
-	if _, err := rand.Read(ivBytes); err != nil {
+	if _, err = rand.Read(ivBytes); err != nil {
 		log.Fatalf("can't initialize crypto: %v", err)
 	}
 	b, err := aes.NewCipher(key)
@@ -85,7 +85,7 @@ func NewArgon2(passphrase []byte, usersalt []byte) (aead cipher.AEAD, salt []byt
 		salt = make([]byte, 8)
 		// http://www.ietf.org/rfc/rfc2898.txt
 		// Salt.
-		if _, err := rand.Read(salt); err != nil {
+		if _, err = rand.Read(salt); err != nil {
 			log.Fatalf("can't get random salt: %v", err)
 		}
 	} else {
@@ -108,9 +108,9 @@ func EncryptChaCha(plaintext []byte, aead cipher.AEAD) (encrypted []byte, err er
 	return
 }
 
-// DecryptChaCha will encrypt ChaCha20-Poly1305 using the pre-generated key
+// DecryptChaCha will decrypt ChaCha20-Poly1305 using the pre-generated key
 // https://pkg.go.dev/golang.org/x/crypto/chacha20poly1305
-func DecryptChaCha(encryptedMsg []byte, aead cipher.AEAD) (encrypted []byte, err error) {
+func DecryptChaCha(encryptedMsg []byte, aead cipher.AEAD) (plaintext []byte, err error) {
 	if len(encryptedMsg) < aead.NonceSize() {
 		err = fmt.Errorf("ciphertext too short")
 		return
@@ -120,6 +120,6 @@ func DecryptChaCha(encryptedMsg []byte, aead cipher.AEAD) (encrypted []byte, err
 	nonce, ciphertext := encryptedMsg[:aead.NonceSize()], encryptedMsg[aead.NonceSize():]
 
 	// Decrypt the message and check it wasn't tampered with.
-	encrypted, err = aead.Open(nil, nonce, ciphertext, nil)
+	plaintext, err = aead.Open(nil, nonce, ciphertext, nil)
 	return
 }

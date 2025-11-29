@@ -5,11 +5,12 @@ import (
 	"path"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"sync"
 	"testing"
 	"time"
 
-	"github.com/schollz/croc/v9/src/tcp"
+	"github.com/schollz/croc/v10/src/tcp"
 	log "github.com/schollz/logger"
 	"github.com/stretchr/testify/assert"
 )
@@ -17,11 +18,11 @@ import (
 func init() {
 	log.SetLevel("trace")
 
-	go tcp.Run("debug", "localhost", "8281", "pass123", "8282,8283,8284,8285")
-	go tcp.Run("debug", "localhost", "8282", "pass123")
-	go tcp.Run("debug", "localhost", "8283", "pass123")
-	go tcp.Run("debug", "localhost", "8284", "pass123")
-	go tcp.Run("debug", "localhost", "8285", "pass123")
+	go tcp.Run("debug", "127.0.0.1", "8281", "pass123", "8282,8283,8284,8285")
+	go tcp.Run("debug", "127.0.0.1", "8282", "pass123")
+	go tcp.Run("debug", "127.0.0.1", "8283", "pass123")
+	go tcp.Run("debug", "127.0.0.1", "8284", "pass123")
+	go tcp.Run("debug", "127.0.0.1", "8285", "pass123")
 	time.Sleep(1 * time.Second)
 }
 
@@ -33,7 +34,7 @@ func TestCrocReadme(t *testing.T) {
 		IsSender:      true,
 		SharedSecret:  "8123-testingthecroc",
 		Debug:         true,
-		RelayAddress:  "localhost:8281",
+		RelayAddress:  "127.0.0.1:8281",
 		RelayPorts:    []string{"8281"},
 		RelayPassword: "pass123",
 		Stdout:        false,
@@ -41,6 +42,7 @@ func TestCrocReadme(t *testing.T) {
 		DisableLocal:  true,
 		Curve:         "siec",
 		Overwrite:     true,
+		GitIgnore:     false,
 	})
 	if err != nil {
 		panic(err)
@@ -51,7 +53,7 @@ func TestCrocReadme(t *testing.T) {
 		IsSender:      false,
 		SharedSecret:  "8123-testingthecroc",
 		Debug:         true,
-		RelayAddress:  "localhost:8281",
+		RelayAddress:  "127.0.0.1:8281",
 		RelayPassword: "pass123",
 		Stdout:        false,
 		NoPrompt:      true,
@@ -66,7 +68,7 @@ func TestCrocReadme(t *testing.T) {
 	var wg sync.WaitGroup
 	wg.Add(2)
 	go func() {
-		filesInfo, emptyFolders, totalNumberFolders, errGet := GetFilesInfo([]string{"../../README.md"}, false)
+		filesInfo, emptyFolders, totalNumberFolders, errGet := GetFilesInfo([]string{"../../README.md"}, false, false, []string{})
 		if errGet != nil {
 			t.Errorf("failed to get minimal info: %v", errGet)
 		}
@@ -92,14 +94,14 @@ func TestCrocEmptyFolder(t *testing.T) {
 	pathName := "../../testEmpty"
 	defer os.RemoveAll(pathName)
 	defer os.RemoveAll("./testEmpty")
-	os.MkdirAll(pathName, 0755)
+	os.MkdirAll(pathName, 0o755)
 
 	log.Debug("setting up sender")
 	sender, err := New(Options{
 		IsSender:      true,
 		SharedSecret:  "8123-testingthecroc",
 		Debug:         true,
-		RelayAddress:  "localhost:8281",
+		RelayAddress:  "127.0.0.1:8281",
 		RelayPorts:    []string{"8281"},
 		RelayPassword: "pass123",
 		Stdout:        false,
@@ -117,7 +119,7 @@ func TestCrocEmptyFolder(t *testing.T) {
 		IsSender:      false,
 		SharedSecret:  "8123-testingthecroc",
 		Debug:         true,
-		RelayAddress:  "localhost:8281",
+		RelayAddress:  "127.0.0.1:8281",
 		RelayPassword: "pass123",
 		Stdout:        false,
 		NoPrompt:      true,
@@ -132,7 +134,7 @@ func TestCrocEmptyFolder(t *testing.T) {
 	var wg sync.WaitGroup
 	wg.Add(2)
 	go func() {
-		filesInfo, emptyFolders, totalNumberFolders, errGet := GetFilesInfo([]string{pathName}, false)
+		filesInfo, emptyFolders, totalNumberFolders, errGet := GetFilesInfo([]string{pathName}, false, false, []string{})
 		if errGet != nil {
 			t.Errorf("failed to get minimal info: %v", errGet)
 		}
@@ -158,7 +160,7 @@ func TestCrocSymlink(t *testing.T) {
 	pathName := "../link-in-folder"
 	defer os.RemoveAll(pathName)
 	defer os.RemoveAll("./link-in-folder")
-	os.MkdirAll(pathName, 0755)
+	os.MkdirAll(pathName, 0o755)
 	os.Symlink("../../README.md", filepath.Join(pathName, "README.link"))
 
 	log.Debug("setting up sender")
@@ -166,7 +168,7 @@ func TestCrocSymlink(t *testing.T) {
 		IsSender:      true,
 		SharedSecret:  "8124-testingthecroc",
 		Debug:         true,
-		RelayAddress:  "localhost:8281",
+		RelayAddress:  "127.0.0.1:8281",
 		RelayPorts:    []string{"8281"},
 		RelayPassword: "pass123",
 		Stdout:        false,
@@ -174,6 +176,7 @@ func TestCrocSymlink(t *testing.T) {
 		DisableLocal:  true,
 		Curve:         "siec",
 		Overwrite:     true,
+		GitIgnore:     false,
 	})
 	if err != nil {
 		panic(err)
@@ -184,7 +187,7 @@ func TestCrocSymlink(t *testing.T) {
 		IsSender:      false,
 		SharedSecret:  "8124-testingthecroc",
 		Debug:         true,
-		RelayAddress:  "localhost:8281",
+		RelayAddress:  "127.0.0.1:8281",
 		RelayPassword: "pass123",
 		Stdout:        false,
 		NoPrompt:      true,
@@ -199,11 +202,11 @@ func TestCrocSymlink(t *testing.T) {
 	var wg sync.WaitGroup
 	wg.Add(2)
 	go func() {
-		filesInfo, emptyFolders, totalNumberFolders, errGet := GetFilesInfo([]string{pathName}, false)
+		filesInfo, emptyFolders, totalNumberFolders, errGet := GetFilesInfo([]string{pathName}, false, false, []string{})
 		if errGet != nil {
 			t.Errorf("failed to get minimal info: %v", errGet)
 		}
-		err := sender.Send(filesInfo, emptyFolders, totalNumberFolders)
+		err = sender.Send(filesInfo, emptyFolders, totalNumberFolders)
 		if err != nil {
 			t.Errorf("send failed: %v", err)
 		}
@@ -211,7 +214,7 @@ func TestCrocSymlink(t *testing.T) {
 	}()
 	time.Sleep(100 * time.Millisecond)
 	go func() {
-		err := receiver.Receive()
+		err = receiver.Receive()
 		if err != nil {
 			t.Errorf("receive failed: %v", err)
 		}
@@ -229,6 +232,32 @@ func TestCrocSymlink(t *testing.T) {
 		t.Errorf("symlink transfer failed: %s", err.Error())
 	}
 }
+func TestCrocIgnoreGit(t *testing.T) {
+	log.SetLevel("trace")
+	defer os.Remove(".gitignore")
+	time.Sleep(300 * time.Millisecond)
+
+	time.Sleep(1 * time.Second)
+	file, err := os.Create(".gitignore")
+	if err != nil {
+		log.Errorf("error creating file")
+	}
+	_, err = file.WriteString("LICENSE")
+	if err != nil {
+		log.Errorf("error writing to file")
+	}
+	time.Sleep(1 * time.Second)
+	// due to how files are ignored in this function, all we have to do to test is make sure LICENSE doesn't get included in FilesInfo.
+	filesInfo, _, _, errGet := GetFilesInfo([]string{"../../LICENSE", ".gitignore", "croc.go"}, false, true, []string{})
+	if errGet != nil {
+		t.Errorf("failed to get minimal info: %v", errGet)
+	}
+	for _, file := range filesInfo {
+		if strings.Contains(file.Name, "LICENSE") {
+			t.Errorf("test failed, should ignore LICENSE")
+		}
+	}
+}
 
 func TestCrocLocal(t *testing.T) {
 	log.SetLevel("trace")
@@ -241,14 +270,15 @@ func TestCrocLocal(t *testing.T) {
 		IsSender:      true,
 		SharedSecret:  "8123-testingthecroc",
 		Debug:         true,
-		RelayAddress:  "localhost:8181",
+		RelayAddress:  "127.0.0.1:8181",
 		RelayPorts:    []string{"8181", "8182"},
 		RelayPassword: "pass123",
 		Stdout:        true,
 		NoPrompt:      true,
 		DisableLocal:  false,
-		Curve:         "siec",
+		Curve:         "ed25519",
 		Overwrite:     true,
+		GitIgnore:     false,
 	})
 	if err != nil {
 		panic(err)
@@ -260,12 +290,12 @@ func TestCrocLocal(t *testing.T) {
 		IsSender:      false,
 		SharedSecret:  "8123-testingthecroc",
 		Debug:         true,
-		RelayAddress:  "localhost:8181",
+		RelayAddress:  "127.0.0.1:8181",
 		RelayPassword: "pass123",
 		Stdout:        true,
 		NoPrompt:      true,
 		DisableLocal:  false,
-		Curve:         "siec",
+		Curve:         "ed25519",
 		Overwrite:     true,
 	})
 	if err != nil {
@@ -276,7 +306,7 @@ func TestCrocLocal(t *testing.T) {
 	os.Create("touched")
 	wg.Add(2)
 	go func() {
-		filesInfo, emptyFolders, totalNumberFolders, errGet := GetFilesInfo([]string{"../../LICENSE", "touched"}, false)
+		filesInfo, emptyFolders, totalNumberFolders, errGet := GetFilesInfo([]string{"../../LICENSE", "touched"}, false, false, []string{})
 		if errGet != nil {
 			t.Errorf("failed to get minimal info: %v", errGet)
 		}
@@ -307,10 +337,10 @@ func TestCrocError(t *testing.T) {
 
 	defer os.Remove(tmpfile.Name()) // clean up
 
-	if _, err := tmpfile.Write(content); err != nil {
+	if _, err = tmpfile.Write(content); err != nil {
 		panic(err)
 	}
-	if err := tmpfile.Close(); err != nil {
+	if err = tmpfile.Close(); err != nil {
 		panic(err)
 	}
 
@@ -329,13 +359,41 @@ func TestCrocError(t *testing.T) {
 		Curve:         "siec",
 		Overwrite:     true,
 	})
-	filesInfo, emptyFolders, totalNumberFolders, errGet := GetFilesInfo([]string{tmpfile.Name()}, false)
+	filesInfo, emptyFolders, totalNumberFolders, errGet := GetFilesInfo([]string{tmpfile.Name()}, false, false, []string{})
 	if errGet != nil {
 		t.Errorf("failed to get minimal info: %v", errGet)
 	}
 	err = sender.Send(filesInfo, emptyFolders, totalNumberFolders)
 	log.Debug(err)
 	assert.NotNil(t, err)
+}
+
+func TestReceiverStdoutWithInvalidSecret(t *testing.T) {
+	// Test for issue: panic when receiving with --stdout and invalid CROC_SECRET
+	// This should fail gracefully without panicking
+	log.SetLevel("warn")
+	receiver, err := New(Options{
+		IsSender:      false,
+		SharedSecret:  "invalid-secret-12345",
+		Debug:         true,
+		RelayAddress:  "127.0.0.1:8281",
+		RelayPassword: "pass123",
+		Stdout:        true, // This is the key flag that triggered the panic
+		NoPrompt:      true,
+		DisableLocal:  true,
+		Curve:         "siec",
+		Overwrite:     true,
+	})
+	if err != nil {
+		t.Errorf("failed to create receiver: %v", err)
+		return
+	}
+
+	// This should fail but not panic
+	err = receiver.Receive()
+	// We expect an error since the secret is invalid and no sender is present
+	assert.NotNil(t, err)
+	log.Debugf("Expected error occurred: %v", err)
 }
 
 func TestCleanUp(t *testing.T) {

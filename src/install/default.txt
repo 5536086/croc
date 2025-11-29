@@ -156,7 +156,7 @@ make_tempdir() {
 
 #---  FUNCTION  ----------------------------------------------------------------
 #          NAME:  determine_os
-#   DESCRIPTION:  Attempts to determin host os using uname
+#   DESCRIPTION:  Attempts to determine host os using uname
 #    PARAMETERS:  none
 #       RETURNS:  0 = OS Detected. Also prints detected os to stdout
 #                 1 = Unknown OS
@@ -180,7 +180,7 @@ determine_os() {
 
 #---  FUNCTION  ----------------------------------------------------------------
 #          NAME:  determine_arch
-#   DESCRIPTION:  Attempt to determin architecture of host
+#   DESCRIPTION:  Attempt to determine architecture of host
 #    PARAMETERS:  none
 #       RETURNS:  0 = Arch Detected. Also prints detected arch to stdout
 #                 1 = Unknown arch
@@ -528,7 +528,7 @@ main() {
   local autocomplete_install_rcode
 
   croc_bin_name="croc"
-  croc_version="9.6.1"
+  croc_version="10.3.1"
   croc_dl_ext="tar.gz"
   croc_base_url="https://github.com/schollz/croc/releases/download"
   prefix="${1}"
@@ -577,6 +577,11 @@ main() {
 
   case "${croc_os}" in
      "Darwin" ) croc_os="macOS";;
+    *"BusyBox"* )
+        croc_os="Linux"
+        ;;
+    "MINGW"* ) croc_os="Windows";
+                croc_dl_ext="zip";;
     "CYGWIN"* ) croc_os="Windows";
                 croc_dl_ext="zip";
                 print_message "== Cygwin is currently unsupported." "error";
@@ -587,16 +592,20 @@ main() {
      "x86_64" ) croc_arch="64bit";;
       "amd64" ) croc_arch="64bit";;
     "aarch64" ) croc_arch="ARM64";;
+      "arm64" ) croc_arch="ARM64";;
      "armv7l" ) croc_arch="ARM";;
+     "armv8l" ) croc_arch="ARM";;
+     "armv9l" ) croc_arch="ARM";;
        "i686" ) croc_arch="32bit";;
+    "riscv64" ) croc_arch="RISCV64";;
             * ) croc_arch="unknown";;
   esac
 
-  croc_file="${croc_bin_name}_${croc_version}_${croc_os}-${croc_arch}.${croc_dl_ext}"
-  croc_checksum_file="${croc_bin_name}_${croc_version}_checksums.txt"
+  croc_file="${croc_bin_name}_v${croc_version}_${croc_os}-${croc_arch}.${croc_dl_ext}"
+  croc_checksum_file="${croc_bin_name}_v${croc_version}_checksums.txt"
   croc_url="${croc_base_url}/v${croc_version}/${croc_file}"
   croc_checksum_url="${croc_base_url}/v${croc_version}/${croc_checksum_file}"
-
+  echo "${croc_url}" "${tmpdir}" "${croc_file}"
   download_file "${croc_url}" "${tmpdir}" "${croc_file}"
   download_file_rcode="${?}"
   if [[ "${download_file_rcode}" == "0" ]]; then
@@ -684,7 +693,7 @@ main() {
     print_message "== Install prefix already exists. No need to create it." "info"
   fi
 
-  [ ! -d "/etc/bash_completion.d/croc" ] && mkdir -p "/etc/bash_completion.d/croc"
+  [ ! -d "${bash_autocomplete_prefix}/croc" ] && mkdir -p "${bash_autocomplete_prefix}/croc" >/dev/null 2>&1
   case "${croc_os}" in
     "Linux" ) install_file_linux "${tmpdir}/${croc_bin_name}" "${prefix}/";
               install_file_rcode="${?}";;
@@ -712,27 +721,27 @@ main() {
     exit 1
   fi
 
-  case "$(basename ${SHELL})" in
-    "bash" ) install_file_linux "${tmpdir}/${bash_autocomplete_file}" "${bash_autocomplete_prefix}/croc";
-             autocomplete_install_rcode="${?}";;
-     "zsh" ) install_file_linux "${tmpdir}/${zsh_autocomplete_file}" "${zsh_autocomplete_prefix}/zsh_autocomplete_croc";
-             autocomplete_install_rcode="${?}";
-             print_message "== You will need to add the following to your ~/.zshrc to enable autocompletion" "info";
-             print_message "\nPROG=croc\n_CLI_ZSH_AUTOCOMPLETE_HACK=1\nsource /etc/zsh/zsh_autocomplete_croc\n" "info";;
-     *)      autocomplete_install_rcode="1";;
-  esac
+  # case "$(basename ${SHELL})" in
+  #   "bash" ) install_file_linux "${tmpdir}/${bash_autocomplete_file}" "${bash_autocomplete_prefix}/croc";
+  #            autocomplete_install_rcode="${?}";;
+  #    "zsh" ) install_file_linux "${tmpdir}/${zsh_autocomplete_file}" "${zsh_autocomplete_prefix}/zsh_autocomplete_croc";
+  #            autocomplete_install_rcode="${?}";
+  #            print_message "== You will need to add the following to your ~/.zshrc to enable autocompletion" "info";
+  #            print_message "\nPROG=croc\n_CLI_ZSH_AUTOCOMPLETE_HACK=1\nsource /etc/zsh/zsh_autocomplete_croc\n" "info";;
+  #    *)      autocomplete_install_rcode="1";;
+  # esac
 
-  if [[ "${autocomplete_install_rcode}" == "0" ]] ; then
-    print_message "== Installed autocompletions for $(basename "${SHELL}")" "ok"
-  elif [[ "${autocomplete_install_rcode}" == "1" ]]; then
-    print_message "== Failed to install ${bash_autocomplete_file}" "error"
-  elif [[ "${autocomplete_install_rcode}" == "20" ]]; then
-    print_message "== Failed to locate 'install' command" "error"
-  elif [[ "${autocomplete_install_rcode}" == "21" ]]; then
-    print_message "== Failed to locate 'sudo' command" "error"
-  else
-    print_message "== Install attempt returned an unexpected value of ${autocomplete_install_rcode}" "error"
-  fi
+  # if [[ "${autocomplete_install_rcode}" == "0" ]] ; then
+  #   print_message "== Installed autocompletions for $(basename "${SHELL}")" "ok"
+  # elif [[ "${autocomplete_install_rcode}" == "1" ]]; then
+  #   print_message "== Failed to install ${bash_autocomplete_file}" "error"
+  # elif [[ "${autocomplete_install_rcode}" == "20" ]]; then
+  #   print_message "== Failed to locate 'install' command" "error"
+  # elif [[ "${autocomplete_install_rcode}" == "21" ]]; then
+  #   print_message "== Failed to locate 'sudo' command" "error"
+  # else
+  #   print_message "== Install attempt returned an unexpected value of ${autocomplete_install_rcode}" "error"
+  # fi
 
   print_message "== Installation complete" "ok"
   

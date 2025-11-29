@@ -10,12 +10,14 @@ import (
 	"strings"
 	"time"
 
-	"github.com/schollz/croc/v9/src/utils"
+	"github.com/magisterquis/connectproxy"
+	"github.com/schollz/croc/v10/src/utils"
 	log "github.com/schollz/logger"
 	"golang.org/x/net/proxy"
 )
 
 var Socks5Proxy = ""
+var HttpProxy = ""
 
 var MAGIC_BYTES = []byte("croc")
 
@@ -39,7 +41,7 @@ func NewConnection(address string, timelimit ...time.Duration) (c *Comm, err err
 		}
 		socks5ProxyURL, urlParseError := url.Parse(Socks5Proxy)
 		if urlParseError != nil {
-			err = fmt.Errorf("Unable to parse socks proxy url: %s", urlParseError)
+			err = fmt.Errorf("unable to parse socks proxy url: %s", urlParseError)
 			log.Debug(err)
 			return
 		}
@@ -51,6 +53,27 @@ func NewConnection(address string, timelimit ...time.Duration) (c *Comm, err err
 		}
 		log.Debug("dialing with dialer.Dial")
 		connection, err = dialer.Dial("tcp", address)
+	} else if HttpProxy != "" && !utils.IsLocalIP(address) {
+		var dialer proxy.Dialer
+		// prepend schema if no schema is given
+		if !strings.Contains(HttpProxy, `://`) {
+			HttpProxy = `http://` + HttpProxy
+		}
+		HttpProxyURL, urlParseError := url.Parse(HttpProxy)
+		if urlParseError != nil {
+			err = fmt.Errorf("unable to parse http proxy url: %s", urlParseError)
+			log.Debug(err)
+			return
+		}
+		dialer, err = connectproxy.New(HttpProxyURL, proxy.Direct)
+		if err != nil {
+			err = fmt.Errorf("proxy failed: %w", err)
+			log.Debug(err)
+			return
+		}
+		log.Debug("dialing with dialer.Dial")
+		connection, err = dialer.Dial("tcp", address)
+
 	} else {
 		log.Debugf("dialing to %s with timelimit %s", address, tlimit)
 		connection, err = net.DialTimeout("tcp", address, tlimit)
@@ -115,11 +138,13 @@ func (c *Comm) Write(b []byte) (n int, err error) {
 
 func (c *Comm) Read() (buf []byte, numBytes int, bs []byte, err error) {
 	// long read deadline in case waiting for file
-	if err := c.connection.SetReadDeadline(time.Now().Add(3 * time.Hour)); err != nil {
+	if err = c.connection.SetReadDeadline(time.Now().Add(3 * time.Hour)); err != nil {
 		log.Warnf("error setting read deadline: %v", err)
 	}
 	// must clear the timeout setting
-	defer c.connection.SetDeadline(time.Time{})
+	if err := c.connection.SetDeadline(time.Time{}); err != nil {
+		log.Warnf("failed to clear deadline: %v", err)
+	}
 
 	// read until we get 4 bytes for the magic
 	header := make([]byte, 4)
@@ -152,7 +177,7 @@ func (c *Comm) Read() (buf []byte, numBytes int, bs []byte, err error) {
 	numBytes = int(numBytesUint32)
 
 	// shorten the reading deadline in case getting weird data
-	if err := c.connection.SetReadDeadline(time.Now().Add(10 * time.Second)); err != nil {
+	if err = c.connection.SetReadDeadline(time.Now().Add(10 * time.Second)); err != nil {
 		log.Warnf("error setting read deadline: %v", err)
 	}
 	buf = make([]byte, numBytes)

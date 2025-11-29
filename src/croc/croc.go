@@ -3,35 +3,41 @@ package croc
 import (
 	"bytes"
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/binary"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
 	"math"
 	"net"
 	"os"
+	"os/exec"
 	"path"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
 
-	"golang.org/x/time/rate"
-
 	"github.com/denisbrodbeck/machineid"
+	ignore "github.com/sabhiram/go-gitignore"
 	log "github.com/schollz/logger"
 	"github.com/schollz/pake/v3"
 	"github.com/schollz/peerdiscovery"
 	"github.com/schollz/progressbar/v3"
+	"github.com/skip2/go-qrcode"
+	"golang.org/x/term"
+	"golang.org/x/time/rate"
 
-	"github.com/schollz/croc/v9/src/comm"
-	"github.com/schollz/croc/v9/src/compress"
-	"github.com/schollz/croc/v9/src/crypt"
-	"github.com/schollz/croc/v9/src/message"
-	"github.com/schollz/croc/v9/src/models"
-	"github.com/schollz/croc/v9/src/tcp"
-	"github.com/schollz/croc/v9/src/utils"
+	"github.com/schollz/croc/v10/src/comm"
+	"github.com/schollz/croc/v10/src/compress"
+	"github.com/schollz/croc/v10/src/crypt"
+	"github.com/schollz/croc/v10/src/message"
+	"github.com/schollz/croc/v10/src/models"
+	"github.com/schollz/croc/v10/src/tcp"
+	"github.com/schollz/croc/v10/src/utils"
 )
 
 var (
@@ -54,28 +60,42 @@ func Debug(debug bool) {
 
 // Options specifies user specific options
 type Options struct {
-	IsSender       bool
-	SharedSecret   string
-	Debug          bool
-	RelayAddress   string
-	RelayAddress6  string
-	RelayPorts     []string
-	RelayPassword  string
-	Stdout         bool
-	NoPrompt       bool
-	NoMultiplexing bool
-	DisableLocal   bool
-	OnlyLocal      bool
-	IgnoreStdin    bool
-	Ask            bool
-	SendingText    bool
-	NoCompress     bool
-	IP             string
-	Overwrite      bool
-	Curve          string
-	HashAlgorithm  string
-	ThrottleUpload string
-	ZipFolder      bool
+	IsSender         bool
+	SharedSecret     string
+	RoomName         string
+	Debug            bool
+	RelayAddress     string
+	RelayAddress6    string
+	RelayPorts       []string
+	RelayPassword    string
+	Stdout           bool
+	NoPrompt         bool
+	NoMultiplexing   bool
+	DisableLocal     bool
+	OnlyLocal        bool
+	IgnoreStdin      bool
+	Ask              bool
+	SendingText      bool
+	NoCompress       bool
+	IP               string
+	Overwrite        bool
+	Curve            string
+	HashAlgorithm    string
+	ThrottleUpload   string
+	ZipFolder        bool
+	TestFlag         bool
+	GitIgnore        bool
+	MulticastAddress string
+	ShowQrCode       bool
+	Exclude          []string
+	Quiet            bool
+	DisableClipboard bool
+	ExtendedClipboard bool
+}
+
+type SimpleMessage struct {
+	Bytes []byte
+	Kind  string
 }
 
 // Client holds the state of the croc transfer
@@ -100,6 +120,7 @@ type Client struct {
 	TotalNumberFolders        int
 	FilesToTransferCurrentNum int
 	FilesHasFinished          map[int]struct{}
+	TotalFilesIgnored         int
 
 	// send / receive information of current file
 	CurrentFile            *os.File
@@ -148,6 +169,7 @@ type FileInfo struct {
 	Symlink      string      `json:"sy,omitempty"`
 	Mode         os.FileMode `json:"md,omitempty"`
 	TempFile     bool        `json:"tf,omitempty"`
+	IsIgnored    bool        `json:"ig,omitempty"`
 }
 
 // RemoteFileRequest requests specific bytes
@@ -177,19 +199,31 @@ func New(ops Options) (c *Client, err error) {
 	// setup basic info
 	c.Options = ops
 	Debug(c.Options.Debug)
-	log.Debugf("options: %+v", c.Options)
+
+	// redirect stderr to null if quiet mode is enabled
+	if c.Options.Quiet {
+		devNull, err := os.OpenFile(os.DevNull, os.O_WRONLY, 0)
+		if err == nil {
+			os.Stderr = devNull
+		}
+	}
 
 	if len(c.Options.SharedSecret) < 6 {
 		err = fmt.Errorf("code is too short")
 		return
 	}
+	// Create a hash of part of the shared secret to use as the room name
+	hashExtra := "croc"
+	roomNameBytes := sha256.Sum256([]byte(c.Options.SharedSecret[:4] + hashExtra))
+	c.Options.RoomName = hex.EncodeToString(roomNameBytes[:])
 
 	c.conn = make([]*comm.Comm, 16)
 
 	// initialize throttler
 	if len(c.Options.ThrottleUpload) > 1 && c.Options.IsSender {
 		upload := c.Options.ThrottleUpload[:len(c.Options.ThrottleUpload)-1]
-		uploadLimit, err := strconv.ParseInt(upload, 10, 64)
+		var uploadLimit int64
+		uploadLimit, err = strconv.ParseInt(upload, 10, 64)
 		if err != nil {
 			panic("Could not parse given Upload Limit")
 		}
@@ -208,8 +242,8 @@ func New(ops Options) (c *Client, err error) {
 				panic("Could not parse given Upload Limit")
 			}
 		}
-		// Somehow 4* is necessary
-		rt = rate.Every(time.Second / (4 * time.Duration(uploadLimit)))
+
+		rt = rate.Every(time.Second / time.Duration(uploadLimit))
 		if int(uploadLimit) > minBurstSize {
 			minBurstSize = int(uploadLimit)
 		}
@@ -235,6 +269,7 @@ type TransferOptions struct {
 	KeepPathInRemote bool
 }
 
+// helper function checking for an empty folder
 func isEmptyFolder(folderPath string) (bool, error) {
 	f, err := os.Open(folderPath)
 	if err != nil {
@@ -249,9 +284,50 @@ func isEmptyFolder(folderPath string) (bool, error) {
 	return false, nil
 }
 
-// This function retrives the important file informations
+// helper function to walk each subfolder and parses against an ignore file.
+// returns a hashmap Key: Absolute filepath, Value: boolean (true=ignore)
+func gitWalk(dir string, gitObj *ignore.GitIgnore, files map[string]bool) {
+	var ignoredDir bool
+	var current string
+	err := filepath.Walk(dir, func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			return err
+		}
+		if isChild(current, path) && ignoredDir {
+			files[path] = true
+			return nil
+		}
+		if info.IsDir() && filepath.Base(path) == filepath.Base(dir) {
+			ignoredDir = false // Skip applying ignore rules for root directory
+			return nil
+		}
+		if gitObj.MatchesPath(info.Name()) {
+			files[path] = true
+			ignoredDir = true
+			current = path
+			return nil
+		} else {
+			files[path] = false
+			ignoredDir = false
+			return nil
+		}
+	})
+	if err != nil {
+		log.Errorf("filepath error")
+	}
+}
+
+func isChild(parentPath, childPath string) bool {
+	relPath, err := filepath.Rel(parentPath, childPath)
+	if err != nil {
+		return false
+	}
+	return !strings.HasPrefix(relPath, "..")
+}
+
+// This function retrieves the important file information
 // for every file that will be transferred
-func GetFilesInfo(fnames []string, zipfolder bool) (filesInfo []FileInfo, emptyFolders []FileInfo, totalNumberFolders int, err error) {
+func GetFilesInfo(fnames []string, zipfolder bool, ignoreGit bool, exclusions []string) (filesInfo []FileInfo, emptyFolders []FileInfo, totalNumberFolders int, err error) {
 	// fnames: the relative/absolute paths of files/folders that will be transferred
 	totalNumberFolders = 0
 	var paths []string
@@ -269,29 +345,66 @@ func GetFilesInfo(fnames []string, zipfolder bool) (filesInfo []FileInfo, emptyF
 			paths = append(paths, fname)
 		}
 	}
-
-	for _, path := range paths {
-		stat, errStat := os.Lstat(path)
+	ignoredPaths := make(map[string]bool)
+	if ignoreGit {
+		wd, wdErr := os.Stat(".gitignore")
+		if wdErr == nil {
+			gitIgnore, gitErr := ignore.CompileIgnoreFile(wd.Name())
+			if gitErr == nil {
+				for _, path := range paths {
+					abs, absErr := filepath.Abs(path)
+					if absErr != nil {
+						err = absErr
+						return
+					}
+					if gitIgnore.MatchesPath(path) {
+						ignoredPaths[abs] = true
+					}
+				}
+			}
+		}
+		for _, path := range paths {
+			abs, absErr := filepath.Abs(path)
+			if absErr != nil {
+				err = absErr
+				return
+			}
+			file, fileErr := os.Stat(path)
+			if fileErr == nil && file.IsDir() {
+				_, subErr := os.Stat(filepath.Join(path, ".gitignore"))
+				if subErr == nil {
+					gitObj, gitObjErr := ignore.CompileIgnoreFile(filepath.Join(path, ".gitignore"))
+					if gitObjErr != nil {
+						err = gitObjErr
+						return
+					}
+					gitWalk(abs, gitObj, ignoredPaths)
+				}
+			}
+		}
+	}
+	for _, fpath := range paths {
+		stat, errStat := os.Lstat(fpath)
 
 		if errStat != nil {
 			err = errStat
 			return
 		}
 
-		absPath, errAbs := filepath.Abs(path)
+		absPath, errAbs := filepath.Abs(fpath)
 
 		if errAbs != nil {
 			err = errAbs
 			return
 		}
-
 		if stat.IsDir() && zipfolder {
-			if path[len(path)-1:] != "/" {
-				path += "/"
+			if fpath[len(fpath)-1:] != "/" {
+				fpath += "/"
 			}
-			path := filepath.Dir(path)
-			dest := filepath.Base(path) + ".zip"
-			utils.ZipDirectory(dest, path)
+			fpath = filepath.Dir(fpath)
+			dest := filepath.Base(fpath) + ".zip"
+			utils.ZipDirectory(dest, fpath)
+			utils.MarkFileForRemoval(dest)
 			stat, errStat = os.Lstat(dest)
 			if errStat != nil {
 				err = errStat
@@ -302,7 +415,8 @@ func GetFilesInfo(fnames []string, zipfolder bool) (filesInfo []FileInfo, emptyF
 				err = errAbs
 				return
 			}
-			filesInfo = append(filesInfo, FileInfo{
+
+			fInfo := FileInfo{
 				Name:         stat.Name(),
 				FolderRemote: "./",
 				FolderSource: filepath.Dir(absPath),
@@ -310,7 +424,12 @@ func GetFilesInfo(fnames []string, zipfolder bool) (filesInfo []FileInfo, emptyF
 				ModTime:      stat.ModTime(),
 				Mode:         stat.Mode(),
 				TempFile:     true,
-			})
+				IsIgnored:    ignoredPaths[absPath],
+			}
+			if fInfo.IsIgnored {
+				continue
+			}
+			filesInfo = append(filesInfo, fInfo)
 			continue
 		}
 
@@ -320,26 +439,41 @@ func GetFilesInfo(fnames []string, zipfolder bool) (filesInfo []FileInfo, emptyF
 					if err != nil {
 						return err
 					}
-					remoteFolder := strings.TrimPrefix(filepath.Dir(pathName),
-						filepath.Dir(absPath)+string(os.PathSeparator))
+					absPathWithSeparator := filepath.Dir(absPath)
+					if !strings.HasSuffix(absPathWithSeparator, string(os.PathSeparator)) {
+						absPathWithSeparator += string(os.PathSeparator)
+					}
+					if strings.HasSuffix(absPathWithSeparator, string(os.PathSeparator)+string(os.PathSeparator)) {
+						absPathWithSeparator = strings.TrimSuffix(absPathWithSeparator, string(os.PathSeparator))
+					}
+					remoteFolder := strings.TrimPrefix(filepath.Dir(pathName), absPathWithSeparator)
 					if !info.IsDir() {
-						filesInfo = append(filesInfo, FileInfo{
+						fInfo := FileInfo{
 							Name:         info.Name(),
-							FolderRemote: strings.Replace(remoteFolder, string(os.PathSeparator), "/", -1) + "/",
+							FolderRemote: strings.ReplaceAll(remoteFolder, string(os.PathSeparator), "/") + "/",
 							FolderSource: filepath.Dir(pathName),
 							Size:         info.Size(),
 							ModTime:      info.ModTime(),
 							Mode:         info.Mode(),
 							TempFile:     false,
-						})
+							IsIgnored:    ignoredPaths[pathName],
+						}
+						if fInfo.IsIgnored && ignoreGit {
+							return nil
+						} else {
+							filesInfo = append(filesInfo, fInfo)
+						}
 					} else {
-						totalNumberFolders++
+						if ignoredPaths[pathName] {
+							return filepath.SkipDir
+						}
 						isEmptyFolder, _ := isEmptyFolder(pathName)
+						totalNumberFolders++
 						if isEmptyFolder {
 							emptyFolders = append(emptyFolders, FileInfo{
 								// Name: info.Name(),
-								FolderRemote: strings.Replace(strings.TrimPrefix(pathName,
-									filepath.Dir(absPath)+string(os.PathSeparator)), string(os.PathSeparator), "/", -1) + "/",
+								FolderRemote: strings.ReplaceAll(strings.TrimPrefix(pathName,
+									filepath.Dir(absPath)+string(os.PathSeparator)), string(os.PathSeparator), "/") + "/",
 							})
 						}
 					}
@@ -350,7 +484,7 @@ func GetFilesInfo(fnames []string, zipfolder bool) (filesInfo []FileInfo, emptyF
 			}
 
 		} else {
-			filesInfo = append(filesInfo, FileInfo{
+			fInfo := FileInfo{
 				Name:         stat.Name(),
 				FolderRemote: "./",
 				FolderSource: filepath.Dir(absPath),
@@ -358,9 +492,14 @@ func GetFilesInfo(fnames []string, zipfolder bool) (filesInfo []FileInfo, emptyF
 				ModTime:      stat.ModTime(),
 				Mode:         stat.Mode(),
 				TempFile:     false,
-			})
+				IsIgnored:    ignoredPaths[absPath],
+			}
+			if fInfo.IsIgnored && ignoreGit {
+				continue
+			} else {
+				filesInfo = append(filesInfo, fInfo)
+			}
 		}
-
 	}
 	return
 }
@@ -391,7 +530,7 @@ func (c *Client) sendCollectFiles(filesInfo []FileInfo) (err error) {
 			c.Options.HashAlgorithm = "xxhash"
 		}
 
-		c.FilesToTransfer[i].Hash, err = utils.HashFile(fullPath, c.Options.HashAlgorithm)
+		c.FilesToTransfer[i].Hash, err = utils.HashFile(fullPath, c.Options.HashAlgorithm, fileInfo.Size > 1e7)
 		log.Debugf("hashed %s to %x using %s", fullPath, c.FilesToTransfer[i].Hash, c.Options.HashAlgorithm)
 		totalFilesSize += fileInfo.Size
 		if err != nil {
@@ -426,7 +565,7 @@ func (c *Client) sendCollectFiles(filesInfo []FileInfo) (err error) {
 func (c *Client) setupLocalRelay() {
 	// setup the relay locally
 	firstPort, _ := strconv.Atoi(c.Options.RelayPorts[0])
-	openPorts := utils.FindOpenPorts("localhost", firstPort, len(c.Options.RelayPorts))
+	openPorts := utils.FindOpenPorts("127.0.0.1", firstPort, len(c.Options.RelayPorts))
 	if len(openPorts) < len(c.Options.RelayPorts) {
 		panic("not enough open ports to run local relay")
 	}
@@ -439,7 +578,7 @@ func (c *Client) setupLocalRelay() {
 			if c.Options.Debug {
 				debugString = "debug"
 			}
-			err := tcp.Run(debugString, "localhost", portStr, c.Options.RelayPassword, strings.Join(c.Options.RelayPorts[1:], ","))
+			err := tcp.Run(debugString, "127.0.0.1", portStr, c.Options.RelayPassword, strings.Join(c.Options.RelayPorts[1:], ","))
 			if err != nil {
 				panic(err)
 			}
@@ -449,7 +588,7 @@ func (c *Client) setupLocalRelay() {
 
 func (c *Client) broadcastOnLocalNetwork(useipv6 bool) {
 	var timeLimit time.Duration
-	//if we don't use an external relay, the broadcast messages need to be sent continuously
+	// if we don't use an external relay, the broadcast messages need to be sent continuously
 	if c.Options.OnlyLocal {
 		timeLimit = -1 * time.Second
 	} else {
@@ -464,6 +603,8 @@ func (c *Client) broadcastOnLocalNetwork(useipv6 bool) {
 	}
 	if useipv6 {
 		settings.IPVersion = peerdiscovery.IPv6
+	} else {
+		settings.MulticastAddress = c.Options.MulticastAddress
 	}
 
 	discoveries, err := peerdiscovery.Discover(settings)
@@ -478,10 +619,10 @@ func (c *Client) transferOverLocalRelay(errchan chan<- error) {
 	time.Sleep(500 * time.Millisecond)
 	log.Debug("establishing connection")
 	var banner string
-	conn, banner, ipaddr, err := tcp.ConnectToTCPServer("localhost:"+c.Options.RelayPorts[0], c.Options.RelayPassword, c.Options.SharedSecret[:3])
+	conn, banner, ipaddr, err := tcp.ConnectToTCPServer("127.0.0.1:"+c.Options.RelayPorts[0], c.Options.RelayPassword, c.Options.RoomName)
 	log.Debugf("banner: %s", banner)
 	if err != nil {
-		err = fmt.Errorf("could not connect to localhost:%s: %w", c.Options.RelayPorts[0], err)
+		err = fmt.Errorf("could not connect to 127.0.0.1:%s: %w", c.Options.RelayPorts[0], err)
 		log.Debug(err)
 		// not really an error because it will try to connect over the actual relay
 		return
@@ -499,7 +640,7 @@ func (c *Client) transferOverLocalRelay(errchan chan<- error) {
 	}
 	c.conn[0] = conn
 	log.Debug("exchanged header message")
-	c.Options.RelayAddress = "localhost"
+	c.Options.RelayAddress = "127.0.0.1"
 	c.Options.RelayPorts = strings.Split(banner, ",")
 	if c.Options.NoMultiplexing {
 		log.Debug("no multiplexing")
@@ -515,23 +656,39 @@ func (c *Client) Send(filesInfo []FileInfo, emptyFoldersToTransfer []FileInfo, t
 	c.TotalNumberFolders = totalNumberFolders
 	c.TotalNumberOfContents = len(filesInfo)
 	err = c.sendCollectFiles(filesInfo)
-
 	if err != nil {
 		return
 	}
 	flags := &strings.Builder{}
-	if c.Options.RelayAddress != models.DEFAULT_RELAY {
+	if c.Options.RelayAddress != models.DEFAULT_RELAY && !c.Options.OnlyLocal {
 		flags.WriteString("--relay " + c.Options.RelayAddress + " ")
 	}
 	if c.Options.RelayPassword != models.DEFAULT_PASSPHRASE {
 		flags.WriteString("--pass " + c.Options.RelayPassword + " ")
 	}
-	fmt.Fprintf(os.Stderr, "Code is: %[1]s\nOn the other computer run\n\ncroc %[2]s%[1]s\n", c.Options.SharedSecret, flags.String())
+	fmt.Fprintf(os.Stderr, `Code is: %[1]s
+
+On the other computer run:
+(For Windows)
+    croc %[2]s%[1]s
+(For Linux/macOS)
+    CROC_SECRET=%[1]q croc %[2]s
+`, c.Options.SharedSecret, flags.String())
+	if !c.Options.DisableClipboard {
+		clipboardText := c.Options.SharedSecret
+		if c.Options.ExtendedClipboard {
+			clipboardText = fmt.Sprintf("CROC_SECRET=%q croc %s", c.Options.SharedSecret, strings.TrimSpace(flags.String()))
+		}
+		copyToClipboard(clipboardText, c.Options.Quiet, c.Options.ExtendedClipboard)
+	}
+	if c.Options.ShowQrCode {
+		showReceiveCommandQrCode(fmt.Sprintf("%[1]s", c.Options.SharedSecret))
+	}
 	if c.Options.Ask {
 		machid, _ := machineid.ID()
 		fmt.Fprintf(os.Stderr, "\rYour machine ID is '%s'\n", machid)
 	}
-	// // c.spinner.Suffix = " waiting for recipient..."
+	// c.spinner.Suffix = " waiting for recipient..."
 	// c.spinner.Start()
 	// create channel for quitting
 	// connect to the relay for messaging
@@ -567,7 +724,7 @@ func (c *Client) Send(filesInfo []FileInfo, emptyFoldersToTransfer []FileInfo, t
 				log.Debugf("got host '%v' and port '%v'", host, port)
 				address = net.JoinHostPort(host, port)
 				log.Debugf("trying connection to %s", address)
-				conn, banner, ipaddr, err = tcp.ConnectToTCPServer(address, c.Options.RelayPassword, c.Options.SharedSecret[:3], durations[i])
+				conn, banner, ipaddr, err = tcp.ConnectToTCPServer(address, c.Options.RelayPassword, c.Options.RoomName, durations[i])
 				if err == nil {
 					c.Options.RelayAddress = address
 					break
@@ -585,13 +742,40 @@ func (c *Client) Send(filesInfo []FileInfo, emptyFoldersToTransfer []FileInfo, t
 			}
 			log.Debugf("banner: %s", banner)
 			log.Debugf("connection established: %+v", conn)
+			var kB []byte
+			B, _ := pake.InitCurve([]byte(c.Options.SharedSecret[5:]), 1, c.Options.Curve)
 			for {
-				log.Debug("waiting for bytes")
+				var dataMessage SimpleMessage
+				log.Trace("waiting for bytes")
 				data, errConn := conn.Receive()
 				if errConn != nil {
-					log.Debugf("[%+v] had error: %s", conn, errConn.Error())
+					log.Tracef("[%+v] had error: %s", conn, errConn.Error())
+				}
+				json.Unmarshal(data, &dataMessage)
+				log.Tracef("data: %+v '%s'", data, data)
+				log.Tracef("dataMessage: %s", dataMessage)
+				log.Tracef("kB: %x", kB)
+				// if kB not null, then use it to decrypt
+				if kB != nil {
+					var decryptErr error
+					var dataDecrypt []byte
+					dataDecrypt, decryptErr = crypt.Decrypt(data, kB)
+					if decryptErr != nil {
+						log.Tracef("error decrypting: %v: '%s'", decryptErr, data)
+						// relay sent a message encrypted with an invalid key.
+						// consider this a security issue and abort
+						if strings.Contains(decryptErr.Error(), "message authentication failed") {
+							errchan <- decryptErr
+							return
+						}
+					} else {
+						// copy dataDecrypt to data
+						data = dataDecrypt
+						log.Tracef("decrypted: %s", data)
+					}
 				}
 				if bytes.Equal(data, ipRequest) {
+					log.Tracef("got ipRequest")
 					// recipient wants to try to connect to local ips
 					var ips []string
 					// only get local ips if the local is enabled
@@ -599,22 +783,48 @@ func (c *Client) Send(filesInfo []FileInfo, emptyFoldersToTransfer []FileInfo, t
 						// get list of local ips
 						ips, err = utils.GetLocalIPs()
 						if err != nil {
-							log.Debugf("error getting local ips: %v", err)
+							log.Tracef("error getting local ips: %v", err)
 						}
 						// prepend the port that is being listened to
 						ips = append([]string{c.Options.RelayPorts[0]}, ips...)
 					}
-					bips, _ := json.Marshal(ips)
-					if err := conn.Send(bips); err != nil {
+					log.Tracef("sending ips: %+v", ips)
+					bips, errIps := json.Marshal(ips)
+					if errIps != nil {
+						log.Tracef("error marshalling ips: %v", errIps)
+					}
+					bips, errIps = crypt.Encrypt(bips, kB)
+					if errIps != nil {
+						log.Tracef("error encrypting ips: %v", errIps)
+					}
+					if err = conn.Send(bips); err != nil {
 						log.Errorf("error sending: %v", err)
 					}
+				} else if dataMessage.Kind == "pake1" {
+					log.Trace("got pake1")
+					var pakeError error
+					pakeError = B.Update(dataMessage.Bytes)
+					if pakeError == nil {
+						kB, pakeError = B.SessionKey()
+						if pakeError == nil {
+							log.Tracef("dataMessage kB: %x", kB)
+							dataMessage.Bytes = B.Bytes()
+							dataMessage.Kind = "pake2"
+							data, _ = json.Marshal(dataMessage)
+							if pakeError = conn.Send(data); err != nil {
+								log.Errorf("dataMessage error sending: %v", err)
+							}
+						}
+
+					}
 				} else if bytes.Equal(data, handshakeRequest) {
+					log.Trace("got handshake")
 					break
 				} else if bytes.Equal(data, []byte{1}) {
-					log.Debug("got ping")
+					log.Trace("got ping")
 					continue
 				} else {
-					log.Debugf("[%+v] got weird bytes: %+v", conn, data)
+					log.Tracef("[%+v] got weird bytes: %+v", conn, data)
 					// throttle the reading
 					errchan <- fmt.Errorf("gracefully refusing using the public relay")
 					return
@@ -635,8 +845,7 @@ func (c *Client) Send(filesInfo []FileInfo, emptyFoldersToTransfer []FileInfo, t
 
 	err = <-errchan
 	if err == nil {
-		// return if no error
-		return
+		return // no error
 	} else {
 		log.Debugf("error from errchan: %v", err)
 		if strings.Contains(err.Error(), "could not secure channel") {
@@ -644,12 +853,19 @@ func (c *Client) Send(filesInfo []FileInfo, emptyFoldersToTransfer []FileInfo, t
 		}
 	}
 	if !c.Options.DisableLocal {
-		if strings.Contains(err.Error(), "refusing files") || strings.Contains(err.Error(), "EOF") || strings.Contains(err.Error(), "bad password") {
+		if strings.Contains(err.Error(), "refusing files") || strings.Contains(err.Error(), "EOF") || strings.Contains(err.Error(), "bad password") || strings.Contains(err.Error(), "message authentication failed") {
 			errchan <- err
 		}
 		err = <-errchan
 	}
 	return err
+}
+
+func showReceiveCommandQrCode(command string) {
+	qrCode, err := qrcode.New(command, qrcode.Medium)
+	if err == nil {
+		fmt.Println(qrCode.ToSmallString(false))
+	}
 }
 
 // Receive will receive a file
@@ -687,10 +903,11 @@ func (c *Client) Receive() (err error) {
 		go func() {
 			defer wgDiscovery.Done()
 			ipv4discoveries, err1 := peerdiscovery.Discover(peerdiscovery.Settings{
-				Limit:     1,
-				Payload:   []byte("ok"),
-				Delay:     20 * time.Millisecond,
-				TimeLimit: 200 * time.Millisecond,
+				Limit:            1,
+				Payload:          []byte("ok"),
+				Delay:            20 * time.Millisecond,
+				TimeLimit:        200 * time.Millisecond,
+				MulticastAddress: c.Options.MulticastAddress,
 			})
 			if err1 == nil && len(ipv4discoveries) > 0 {
 				dmux.Lock()
@@ -764,7 +981,7 @@ func (c *Client) Receive() (err error) {
 		log.Debugf("got host '%v' and port '%v'", host, port)
 		address = net.JoinHostPort(host, port)
 		log.Debugf("trying connection to %s", address)
-		c.conn[0], banner, c.ExternalIP, err = tcp.ConnectToTCPServer(address, c.Options.RelayPassword, c.Options.SharedSecret[:3], durations[i])
+		c.conn[0], banner, c.ExternalIP, err = tcp.ConnectToTCPServer(address, c.Options.RelayPassword, c.Options.RoomName, durations[i])
 		if err == nil {
 			c.Options.RelayAddress = address
 			break
@@ -779,23 +996,73 @@ func (c *Client) Receive() (err error) {
 	log.Debugf("receiver connection established: %+v", c.conn[0])
 	log.Debugf("banner: %s", banner)
 
-	if !usingLocal && !c.Options.DisableLocal && !isIPset {
+	if c.Options.TestFlag {
+		log.Debugf("TEST FLAG ENABLED, TESTING LOCAL IPS")
+	}
+	if c.Options.TestFlag || (!usingLocal && !c.Options.DisableLocal && !isIPset) {
 		// ask the sender for their local ips and port
 		// and try to connect to them
-		log.Debug("sending ips?")
-		var data []byte
-		if err := c.conn[0].Send(ipRequest); err != nil {
-			log.Errorf("ips send error: %v", err)
-		}
-		data, err = c.conn[0].Receive()
-		if err != nil {
-			return
-		}
-		log.Debugf("ips data: %s", data)
 		var ips []string
-		if err := json.Unmarshal(data, &ips); err != nil {
-			log.Debugf("ips unmarshal error: %v", err)
-		}
+		err = func() (err error) {
+			var A *pake.Pake
+			var data []byte
+			A, err = pake.InitCurve([]byte(c.Options.SharedSecret[5:]), 0, c.Options.Curve)
+			if err != nil {
+				return err
+			}
+			dataMessage := SimpleMessage{
+				Bytes: A.Bytes(),
+				Kind:  "pake1",
+			}
+			data, _ = json.Marshal(dataMessage)
+			if err = c.conn[0].Send(data); err != nil {
+				log.Errorf("dataMessage send error: %v", err)
+				return
+			}
+			data, err = c.conn[0].Receive()
+			if err != nil {
+				return
+			}
+			err = json.Unmarshal(data, &dataMessage)
+			if err != nil || dataMessage.Kind != "pake2" {
+				log.Debugf("data: %s", data)
+				return fmt.Errorf("dataMessage %s pake failed", ipRequest)
+			}
+			err = A.Update(dataMessage.Bytes)
+			if err != nil {
+				return
+			}
+			var kA []byte
+			kA, err = A.SessionKey()
+			if err != nil {
+				return
+			}
+			log.Debugf("dataMessage kA: %x", kA)
+
+			// secure ipRequest
+			data, err = crypt.Encrypt([]byte(ipRequest), kA)
+			if err != nil {
+				return
+			}
+			log.Debug("sending ips?")
+			if err = c.conn[0].Send(data); err != nil {
+				log.Errorf("ips send error: %v", err)
+			}
+			data, err = c.conn[0].Receive()
+			if err != nil {
+				return
+			}
+			data, err = crypt.Decrypt(data, kA)
+			if err != nil {
+				return
+			}
+			log.Debugf("ips data: %s", data)
+			if err = json.Unmarshal(data, &ips); err != nil {
+				log.Debugf("ips unmarshal error: %v", err)
+			}
+			return
+		}()
+
 		if len(ips) > 1 {
 			port := ips[0]
 			ips = ips[1:]
@@ -806,8 +1073,10 @@ func (c *Client) Receive() (err error) {
 				haveLocalIP := false
 				for _, localIP := range localIps {
 					localIPparsed := net.ParseIP(localIP)
+					log.Debugf("localIP: %+v, localIPparsed: %+v", localIP, localIPparsed)
 					if ipv4Net.Contains(localIPparsed) {
 						haveLocalIP = true
+						log.Debugf("ip: %+v is a local IP", ip)
 						break
 					}
 				}
@@ -817,10 +1086,10 @@ func (c *Client) Receive() (err error) {
 				}
 
 				serverTry := net.JoinHostPort(ip, port)
-				conn, banner2, externalIP, errConn := tcp.ConnectToTCPServer(serverTry, c.Options.RelayPassword, c.Options.SharedSecret[:3], 500*time.Millisecond)
+				conn, banner2, externalIP, errConn := tcp.ConnectToTCPServer(serverTry, c.Options.RelayPassword, c.Options.RoomName, 500*time.Millisecond)
 				if errConn != nil {
 					log.Debug(errConn)
-					log.Debugf("could not connect to " + serverTry)
+					log.Debug("could not connect to " + serverTry)
 					continue
 				}
 				log.Debugf("local connection established to %s", serverTry)
@@ -837,7 +1106,7 @@ func (c *Client) Receive() (err error) {
 		}
 	}
 
-	if err := c.conn[0].Send(handshakeRequest); err != nil {
+	if err = c.conn[0].Send(handshakeRequest); err != nil {
 		log.Errorf("handshake send error: %v", err)
 	}
 	c.Options.RelayPorts = strings.Split(banner, ",")
@@ -850,7 +1119,7 @@ func (c *Client) Receive() (err error) {
 	err = c.transfer()
 	if err == nil {
 		if c.numberOfTransferredFiles+len(c.EmptyFoldersToTransfer) == 0 {
-			fmt.Fprintf(os.Stderr, "\rNo files transferred.")
+			fmt.Fprintf(os.Stderr, "\rNo files transferred.\n")
 		}
 	}
 	return
@@ -889,6 +1158,7 @@ func (c *Client) transfer() (err error) {
 		}
 		done, err = c.processMessage(data)
 		if err != nil {
+			log.Debugf("data: %s", data)
 			log.Debugf("got error processing: %v", err)
 			break
 		}
@@ -922,7 +1192,7 @@ func (c *Client) transfer() (err error) {
 		}
 	}
 
-	if c.Options.Stdout && !c.Options.IsSender {
+	if c.Options.Stdout && !c.Options.IsSender && len(c.FilesToTransfer) > 0 && c.FilesToTransferCurrentNum < len(c.FilesToTransfer) {
 		pathToFile := path.Join(
 			c.FilesToTransfer[c.FilesToTransferCurrentNum].FolderRemote,
 			c.FilesToTransfer[c.FilesToTransferCurrentNum].Name,
@@ -933,10 +1203,10 @@ func (c *Client) transfer() (err error) {
 			c.CurrentFile.Close()
 			c.CurrentFileIsClosed = true
 		}
-		if err := os.Remove(pathToFile); err != nil {
+		if err = os.Remove(pathToFile); err != nil {
 			log.Warnf("error removing %s: %v", pathToFile, err)
 		}
-		fmt.Print("\n")
+		fmt.Fprint(os.Stderr, "\n")
 	}
 	if err != nil && strings.Contains(err.Error(), "pake not successful") {
 		log.Debugf("pake error: %s", err.Error())
@@ -944,7 +1214,7 @@ func (c *Client) transfer() (err error) {
 	}
 	if err != nil && strings.Contains(err.Error(), "unexpected end of JSON input") {
 		log.Debugf("error: %s", err.Error())
-		err = fmt.Errorf("room not ready")
+		err = fmt.Errorf("room (secure channel) not ready, maybe peer disconnected")
 	}
 	return
 }
@@ -984,6 +1254,19 @@ func (c *Client) processMessageFileInfo(m message.Message) (done bool, err error
 	c.EmptyFoldersToTransfer = senderInfo.EmptyFoldersToTransfer
 	c.TotalNumberFolders = senderInfo.TotalNumberFolders
 	c.FilesToTransfer = senderInfo.FilesToTransfer
+	for i, fi := range c.FilesToTransfer {
+		// Issues #593 - sanitize the sender paths and prevent ".." from being used
+		c.FilesToTransfer[i].FolderRemote = filepath.Clean(fi.FolderRemote)
+		// Issues #593 - disallow specific folders like .ssh
+		if strings.Contains(c.FilesToTransfer[i].FolderRemote, ".ssh") {
+			return true, fmt.Errorf("invalid path detected: '%s'", fi.FolderRemote)
+		}
+		// Issue #595 - disallow filenames with invisible characters
+		errFileName := utils.ValidFileName(path.Join(c.FilesToTransfer[i].FolderRemote, fi.Name))
+		if errFileName != nil {
+			return true, errFileName
+		}
+	}
 	c.TotalNumberOfContents = 0
 	if c.FilesToTransfer != nil {
 		c.TotalNumberOfContents += len(c.FilesToTransfer)
@@ -1021,6 +1304,12 @@ func (c *Client) processMessageFileInfo(m message.Message) (done bool, err error
 			}
 		}
 	}
+	// check the totalSize does not exceed disk space
+	// usage := diskusage.NewDiskUsage(".")
+	// if usage.Available() < uint64(totalSize) {
+	// 	return true, fmt.Errorf("not enough disk space")
+	// }
+
 	// c.spinner.Stop()
 	action := "Accept"
 	if c.Options.SendingText {
@@ -1153,7 +1442,7 @@ func (c *Client) processMessagePake(m message.Message) (err error) {
 		go func(j int) {
 			defer wg.Done()
 			var host string
-			if c.Options.RelayAddress == "localhost" {
+			if c.Options.RelayAddress == "127.0.0.1" {
 				host = c.Options.RelayAddress
 			} else {
 				host, _, err = net.SplitHostPort(c.Options.RelayAddress)
@@ -1167,7 +1456,7 @@ func (c *Client) processMessagePake(m message.Message) (err error) {
 			c.conn[j+1], _, _, err = tcp.ConnectToTCPServer(
 				server,
 				c.Options.RelayPassword,
-				fmt.Sprintf("%s-%d", utils.SHA256(c.Options.SharedSecret[:5])[:6], j),
+				fmt.Sprintf("%s-%d", c.Options.RoomName, j),
 			)
 			if err != nil {
 				panic(err)
@@ -1179,7 +1468,6 @@ func (c *Client) processMessagePake(m message.Message) (err error) {
 		}(i)
 	}
 	wg.Wait()
-
 	if !c.Options.IsSender {
 		log.Debug("sending external IP")
 		err = message.Send(c.conn[0], c.Key, message.Message{
@@ -1356,7 +1644,7 @@ func (c *Client) recipientInitializeFile() (err error) {
 	var errOpen error
 	c.CurrentFile, errOpen = os.OpenFile(
 		pathToFile,
-		os.O_WRONLY, 0666)
+		os.O_WRONLY, 0o666)
 	var truncate bool // default false
 	c.CurrentFileChunks = []int64{}
 	c.CurrentFileChunkRanges = []int64{}
@@ -1378,6 +1666,10 @@ func (c *Client) recipientInitializeFile() (err error) {
 			errOpen = fmt.Errorf("could not create %s: %w", pathToFile, errOpen)
 			log.Error(errOpen)
 			return errOpen
+		}
+		errChmod := os.Chmod(pathToFile, c.FilesToTransfer[c.FilesToTransferCurrentNum].Mode.Perm())
+		if errChmod != nil {
+			log.Error(errChmod)
 		}
 		truncate = true
 	}
@@ -1404,6 +1696,7 @@ func (c *Client) recipientGetFileReady(finished bool) (err error) {
 		}
 		c.SuccessfulTransfer = true
 		c.FilesHasFinished[c.FilesToTransferCurrentNum] = struct{}{}
+		return
 	}
 
 	err = c.recipientInitializeFile()
@@ -1437,6 +1730,25 @@ func (c *Client) recipientGetFileReady(finished bool) (err error) {
 	}
 	c.Step3RecipientRequestFile = true
 	return
+}
+
+func max(a int, b int) int {
+	if a > b {
+		return a
+	}
+	return b
+}
+
+func formatDescription(description string) string {
+	width, _, err := term.GetSize(int(os.Stdout.Fd()))
+	width = max(20, width-60)
+	if err != nil {
+		return description
+	}
+	if len(description) > width {
+		description = description[:(width-3)] + "..."
+	}
+	return description
 }
 
 func (c *Client) createEmptyFileAndFinish(fileInfo FileInfo, i int) (err error) {
@@ -1481,7 +1793,7 @@ func (c *Client) createEmptyFileAndFinish(fileInfo FileInfo, i int) (err error) 
 			c.fmtPrintUpdate()
 		}),
 		progressbar.OptionSetWidth(20),
-		progressbar.OptionSetDescription(description),
+		progressbar.OptionSetDescription(formatDescription(description)),
 		progressbar.OptionSetRenderBlankState(true),
 		progressbar.OptionShowBytes(true),
 		progressbar.OptionShowCount(),
@@ -1493,7 +1805,7 @@ func (c *Client) createEmptyFileAndFinish(fileInfo FileInfo, i int) (err error) 
 }
 
 func (c *Client) updateIfRecipientHasFileInfo() (err error) {
-	if !(!c.Options.IsSender && c.Step2FileInfoTransferred && !c.Step3RecipientRequestFile) {
+	if c.Options.IsSender || !c.Step2FileInfoTransferred || c.Step3RecipientRequestFile {
 		return
 	}
 	// find the next file to transfer and send that number
@@ -1537,18 +1849,26 @@ func (c *Client) updateIfRecipientHasFileInfo() (err error) {
 				percentDone := 100 - float64(len(missingChunks)*models.TCP_BUFFER_SIZE/2)/float64(fileInfo.Size)*100
 
 				log.Debug("asking to overwrite")
-				prompt := fmt.Sprintf("\nOverwrite '%s'? (y/N) ", path.Join(fileInfo.FolderRemote, fileInfo.Name))
+				prompt := fmt.Sprintf("\nOverwrite '%s'? (y/N) (use --overwrite to omit) ", path.Join(fileInfo.FolderRemote, fileInfo.Name))
 				if percentDone < 99 {
-					prompt = fmt.Sprintf("\nResume '%s' (%2.1f%%)? (y/N) ", path.Join(fileInfo.FolderRemote, fileInfo.Name), percentDone)
+					prompt = fmt.Sprintf("\nResume '%s' (%2.1f%%)? (y/N)   (use --overwrite to omit) ", path.Join(fileInfo.FolderRemote, fileInfo.Name), percentDone)
 				}
 				choice := strings.ToLower(utils.GetInput(prompt))
 				if choice != "y" && choice != "yes" {
-					fmt.Fprintf(os.Stderr, "skipping '%s'", path.Join(fileInfo.FolderRemote, fileInfo.Name))
+					fmt.Fprintf(os.Stderr, "Skipping '%s'\n", path.Join(fileInfo.FolderRemote, fileInfo.Name))
 					continue
 				}
 			}
 		} else {
 			log.Debugf("hashes are equal %x == %x", fileHash, fileInfo.Hash)
+
+			if !fileInfo.ModTime.IsZero() {
+				if err := os.Chtimes(path.Join(fileInfo.FolderRemote, fileInfo.Name), fileInfo.ModTime, fileInfo.ModTime); err != nil {
+					log.Warnf("chtimes %v: %v", fileInfo.ModTime, err)
+				} else {
+					log.Debugf("chtimes %v", fileInfo.ModTime)
+				}
+			}
 		}
 		if errHash != nil {
 			// probably can't find, its okay
@@ -1605,12 +1925,13 @@ func (c *Client) updateState() (err error) {
 						description = c.FilesToTransfer[i].Name
 						// description = ""
 					}
+
 					c.bar = progressbar.NewOptions64(1,
 						progressbar.OptionOnCompletion(func() {
 							c.fmtPrintUpdate()
 						}),
 						progressbar.OptionSetWidth(20),
-						progressbar.OptionSetDescription(description),
+						progressbar.OptionSetDescription(formatDescription(description)),
 						progressbar.OptionSetRenderBlankState(true),
 						progressbar.OptionShowBytes(true),
 						progressbar.OptionShowCount(),
@@ -1658,7 +1979,7 @@ func (c *Client) setBar() {
 			c.fmtPrintUpdate()
 		}),
 		progressbar.OptionSetWidth(20),
-		progressbar.OptionSetDescription(description),
+		progressbar.OptionSetDescription(formatDescription(description)),
 		progressbar.OptionSetRenderBlankState(true),
 		progressbar.OptionShowBytes(true),
 		progressbar.OptionShowCount(),
@@ -1679,14 +2000,14 @@ func (c *Client) setBar() {
 }
 
 func (c *Client) receiveData(i int) {
-	log.Debugf("%d receiving data", i)
+	log.Tracef("%d receiving data", i)
 	for {
 		data, err := c.conn[i+1].Receive()
 		if err != nil {
 			break
 		}
 		if bytes.Equal(data, []byte{1}) {
-			log.Debug("got ping")
+			log.Trace("got ping")
 			continue
 		}
 
@@ -1720,7 +2041,7 @@ func (c *Client) receiveData(i int) {
 		if !c.CurrentFileIsClosed && (c.TotalChunksTransferred == len(c.CurrentFileChunks) || c.TotalSent == c.FilesToTransfer[c.FilesToTransferCurrentNum].Size) {
 			c.CurrentFileIsClosed = true
 			log.Debug("finished receiving!")
-			if err := c.CurrentFile.Close(); err != nil {
+			if err = c.CurrentFile.Close(); err != nil {
 				log.Debugf("error closing %s: %v", c.CurrentFile.Name(), err)
 			} else {
 				log.Debugf("Successful closing %s", c.CurrentFile.Name())
@@ -1762,62 +2083,66 @@ func (c *Client) sendData(i int) {
 	curi := float64(0)
 	for {
 		// Read file
-		data := make([]byte, models.TCP_BUFFER_SIZE/2)
-		// log.Debugf("%d trying to read", i)
-		n, errRead := c.fread.ReadAt(data, readingPos)
-		// log.Debugf("%d read %d bytes", i, n)
-		readingPos += int64(n)
-		if c.limiter != nil {
-			r := c.limiter.ReserveN(time.Now(), n)
-			log.Debugf("Limiting Upload for %d", r.Delay())
-			time.Sleep(r.Delay())
-		}
-
+		var n int
+		var errRead error
 		if math.Mod(curi, float64(len(c.Options.RelayPorts))) == float64(i) {
-			// check to see if this is a chunk that the recipient wants
-			usableChunk := true
-			c.mutex.Lock()
-			if len(c.chunkMap) != 0 {
-				if _, ok := c.chunkMap[pos]; !ok {
-					usableChunk = false
-				} else {
-					delete(c.chunkMap, pos)
-				}
+			data := make([]byte, models.TCP_BUFFER_SIZE/2)
+			n, errRead = c.fread.ReadAt(data, readingPos)
+			if c.limiter != nil {
+				r := c.limiter.ReserveN(time.Now(), n)
+				log.Debugf("Limiting Upload for %d", r.Delay())
+				time.Sleep(r.Delay())
 			}
-			c.mutex.Unlock()
-			if usableChunk {
-				// log.Debugf("sending chunk %d", pos)
-				posByte := make([]byte, 8)
-				binary.LittleEndian.PutUint64(posByte, pos)
-				var err error
-				var dataToSend []byte
-				if c.Options.NoCompress {
-					dataToSend, err = crypt.Encrypt(
-						append(posByte, data[:n]...),
-						c.Key,
-					)
-				} else {
-					dataToSend, err = crypt.Encrypt(
-						compress.Compress(
+			if n > 0 {
+				// check to see if this is a chunk that the recipient wants
+				usableChunk := true
+				c.mutex.Lock()
+				if len(c.chunkMap) != 0 {
+					if _, ok := c.chunkMap[pos]; !ok {
+						usableChunk = false
+					} else {
+						delete(c.chunkMap, pos)
+					}
+				}
+				c.mutex.Unlock()
+				if usableChunk {
+					// log.Debugf("sending chunk %d", pos)
+					posByte := make([]byte, 8)
+					binary.LittleEndian.PutUint64(posByte, pos)
+					var err error
+					var dataToSend []byte
+					if c.Options.NoCompress {
+						dataToSend, err = crypt.Encrypt(
 							append(posByte, data[:n]...),
-						),
-						c.Key,
-					)
-				}
-				if err != nil {
-					panic(err)
-				}
+							c.Key,
+						)
+					} else {
+						dataToSend, err = crypt.Encrypt(
+							compress.Compress(
+								append(posByte, data[:n]...),
+							),
+							c.Key,
+						)
+					}
+					if err != nil {
+						panic(err)
+					}
 
-				err = c.conn[i+1].Send(dataToSend)
-				if err != nil {
-					panic(err)
+					err = c.conn[i+1].Send(dataToSend)
+					if err != nil {
+						panic(err)
+					}
+					c.bar.Add(n)
+					c.TotalSent += int64(n)
+					// time.Sleep(100 * time.Millisecond)
 				}
-				c.bar.Add(n)
-				c.TotalSent += int64(n)
-				// time.Sleep(100 * time.Millisecond)
 			}
 		}
 
+		if n == 0 {
+			n = models.TCP_BUFFER_SIZE / 2
+		}
+		readingPos += int64(n)
 		curi++
 		pos += uint64(n)
 
@@ -1826,6 +2151,61 @@ func (c *Client) sendData(i int) {
 				break
 			}
 			panic(errRead)
+		}
+	}
+}
+
+// isExecutableInPath checks for the availability of an executable
+func isExecutableInPath(executableName string) bool {
+	_, err := exec.LookPath(executableName)
+	return err == nil
+}
+
+// copyToClipboard tries to send the code to the operating system clipboard
+func copyToClipboard(str string, quiet bool, extendedClipboard bool) {
+	var cmd *exec.Cmd
+	switch runtime.GOOS {
+	// Windows should always have clip.exe in PATH by default
+	case "windows":
+		cmd = exec.Command("clip")
+	// MacOS uses pbcopy
+	case "darwin":
+		cmd = exec.Command("pbcopy")
+	// These Unix-like systems are likely using Xorg(with xclip or xsel) or Wayland(with wl-copy or waycopy)
+	case "linux", "android", "hurd", "freebsd", "openbsd", "netbsd", "dragonfly", "solaris", "illumos", "plan9":
+		if os.Getenv("XDG_SESSION_TYPE") == "wayland" { // Wayland running
+			if isExecutableInPath("wl-copy") {
+				cmd = exec.Command("wl-copy")
+			} else if isExecutableInPath("waycopy") {
+				cmd = exec.Command("waycopy")
+			}
+		} else if os.Getenv("XDG_SESSION_TYPE") == "x11" || os.Getenv("XDG_SESSION_TYPE") == "xorg" { // Xorg running
+			if isExecutableInPath("xclip") {
+				cmd = exec.Command("xclip", "-selection", "clipboard")
+			}
+		} else if isExecutableInPath("xsel") {
+			cmd = exec.Command("xsel", "-b")
+		} else if isExecutableInPath("termux-clipboard-set") {
+			cmd = exec.Command("termux-clipboard-set")
+		}
+	default:
+		return
+	}
+	// Nothing has been found
+	if cmd == nil {
+		return
+	}
+	// Sending stdin into the available clipboard program
+	cmd.Stdin = bytes.NewReader([]byte(str))
+	if err := cmd.Run(); err != nil {
+		log.Debugf("error copying to clipboard: %v", err)
+		return
+	}
+	if !quiet {
+		if extendedClipboard {
+			fmt.Fprintf(os.Stderr, "Command copied to clipboard!\n")
+		} else {
+			fmt.Fprintf(os.Stderr, "Code copied to clipboard!\n")
 		}
 	}
 }
